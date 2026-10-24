@@ -6,10 +6,9 @@ import ccxt
 import pandas as pd
 import requests
 
-# ਟੈਲੀਗ੍ਰਾਮ ਕੌਂਫਿਗਰੇਸ਼ਨ
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("CHAT_ID")
-STATE_FILE = "alerted_4h_choh_retest.json"
+STATE_FILE = "alerted_4h_perfect_retest.json"
 
 
 def send_telegram(msg):
@@ -43,7 +42,7 @@ def save_state(d):
 
 
 def run_scanner():
-  print("🚀 MEXC ਐਕਸਚੇਂਜ ਲੋਡ ਹੋ ਰਹੀ ਹੈ...")
+  print("🚀 MEXC ਐਕਸਚੇਂਜ ਸਕੈਨਿੰਗ ਸ਼ੁਰੂ ਹੋ ਗਈ ਹੈ...")
   exchange = ccxt.mexc({"enableRateLimit": True})
   exchange.load_markets()
 
@@ -70,7 +69,7 @@ def run_scanner():
   alerted = load_state()
   now = datetime.now(timezone.utc)
 
-  # ਪੁਰਾਣੇ ਅਲਰਟ 4 ਦਿਨਾਂ ਬਾਅਦ ਸਾਫ਼ ਕਰੋ
+  # ਪੁਰਾਣੇ ਅਲਰਟ 4 ਦਿਨਾਂ ਬਾਅਦ ਕਲੀਅਰ ਕਰੋ
   alerted = {
       k: v
       for k, v in alerted.items()
@@ -78,7 +77,9 @@ def run_scanner():
   }
 
   TF = "4h"
-  print(f"🔍 4 ਘੰਟੇ (4h) ਟਾਈਮਫ੍ਰੇਮ ਸਕੈਨ ਕੀਤਾ ਜਾ ਰਿਹਾ ਹੈ...")
+  print(
+      f"🔍 {len(syms)} ਕੋਇਨਾਂ ਦਾ 4 ਘੰਟੇ (4h) ਟਾਈਮਫ੍ਰੇਮ ਸਕੈਨ ਕੀਤਾ ਜਾ ਰਿਹਾ ਹੈ..."
+  )
   alert_count = 0
 
   for sym in syms:
@@ -92,7 +93,7 @@ def run_scanner():
         continue
 
       df = pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
-      df = df.iloc[:-1]  # ਮੌਜੂਦਾ ਚੱਲ ਰਹੀ ਕੈਂਡਲ ਨੂੰ ਛੱਡੋ
+      df = df.iloc[:-1]  # ਮੌਜੂਦਾ ਚੱਲ ਰਹੀ ਕੈਂਡਲ ਛੱਡੋ
 
       close, open_, high, low, volume = (
           df["c"],
@@ -102,22 +103,22 @@ def run_scanner():
           df["v"],
       )
 
-      # EMA ਕੈਲਕੁਲੇਸ਼ਨ (EMA 6, 12, 20)
+      # EMA ਕੈਲਕੁਲੇਸ਼ਨ (6, 12, 20)
       ema6 = close.ewm(span=6).mean()
       ema12 = close.ewm(span=12).mean()
       ema20 = close.ewm(span=20).mean()
 
       e6, e12, e20 = ema6.iloc[-1], ema12.iloc[-1], ema20.iloc[-1]
 
-      # 1. ਬੇਸ / ਡਾਊਨਟਰੈਂਡ ਚੈੱਕ (ਪੁਰਾਣੀ ਰੇਂਜ)
+      # 1. ਪਿਛਲਾ ਬੇਸ/ਡਾਊਨਟਰੈਂਡ ਚੈੱਕ
       base_check = (ema6.iloc[-50:-15] < ema12.iloc[-50:-15]).mean()
       if base_check < 0.50:
         continue
 
-      # 2. CHOCH ਲੈਵਲ (ਪਿਛਲਾ ਸਭ ਤੋਂ ਉੱਚਾ ਸਵਿੰਗ ਹਾਈ)
+      # 2. CHOCH ਲੈਵਲ (ਸਵਿੰਗ ਹਾਈ)
       last_LH = df.iloc[-65:-15]["h"].max()
 
-      # 3. CHOCH ਬ੍ਰੇਕਆਉਟ ਚੈੱਕ (ਵਾਲਿਊਮ ਸਪਾਈਕ ਨਾਲ ਬ੍ਰੇਕਆਉਟ)
+      # 3. ਵਾਲਿਊਮ ਸਪਾਈਕ ਨਾਲ CHOCH ਬ੍ਰੇਕਆਉਟ
       breakout_found = False
       breakout_idx = -1
 
@@ -130,7 +131,7 @@ def run_scanner():
         )
         avg_v = volume.iloc[i - 25 : i].mean()
 
-        if h_i > last_LH and c_i > o_i and v_i > avg_v * 2.0:
+        if h_i > last_LH and c_i > o_i and v_i > avg_v * 1.8:
           breakout_found = True
           breakout_idx = i
           break
@@ -138,39 +139,31 @@ def run_scanner():
       if not breakout_found:
         continue
 
-      # 4. ਰੀਟੈਸਟ (Zone A) ਚੈੱਕ: ਪ੍ਰਾਈਸ ਹੌਲੀ-ਹੌਲੀ ਵਾਪਸ ਸਪੋਰਟ 'ਤੇ ਆਵੇ
+      # 4. Zone A / Point C 'ਤੇ ਰੀਟੈਸਟ ਚੈੱਕ (ਰੈੱਡ ਕੈਂਡਲ ਅਤੇ ਘੱਟ ਵਾਲਿਊਮ)
       c_last = close.iloc[-1]
-      o_last = open_.iloc[-1]
-
-      # ਰੀਟੈਸਟ ਕੈਂਡਲ ਛੋਟੀ ਜਾਂ ਰੈੱਡ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ (ਹੋਲਡਿੰਗ ਫੇਜ਼)
-      # EMA ਕਲੱਸਟਰ (Zone A) ਦੇ ਬਹੁਤ ਨੇੜੇ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ
-      ema_min = min(e6, e12, e20)
       ema_max = max(e6, e12, e20)
 
-      # ਪ੍ਰਾਈਸ ਪ੍ਰੋਕਸੀਮੀਟੀ (Zone A ਵਿੱਚ)
       retest_dist = abs(c_last - ema_max) / ema_max * 100
-      if retest_dist > 3.0:
+      if retest_dist > 3.2:
         continue
 
-      # ਵਾਲਿਊਮ ਰੀਟੈਸਟ ਵੇਲੇ ਘੱਟ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ (ਡਰਾਈ ਅੱਪ)
       breakout_vol = volume.iloc[breakout_idx]
       current_vol = volume.iloc[-1]
-      if current_vol > breakout_vol * 0.65:
+      if current_vol > breakout_vol * 0.70:
         continue
 
-      # EMA ਬੁੱਲਿਸ਼ ਅਲਾਈਨਮੈਂਟ
       if not (e6 > e12 > e20):
         continue
 
       coin = sym.replace("/USDT:USDT", "")
 
-      # ਟੈਲੀਗ੍ਰਾਮ ਸੁਨੇਹਾ
+      # ਟੈਲੀਗ੍ਰਾਮ ਮੈਸੇਜ
       msg = (
-          f"🚨 **4H CHOCH + ZONE A RETEST [ਅਲਰਟ]** 🚨\n\n"
+          f"🚨 **4H CHOCH + ZONE A (POINT C) RETEST** 🚨\n\n"
           f"🪙 **ਕੋਇਨ:** `{coin}`\n"
-          f"💲 **ਪ੍ਰਾਈਸ (Zone A):** `{c_last:.5f}`\n"
+          f"💲 **ಪ್ರਾਈਸ (Zone A):** `{c_last:.5f}`\n"
           f"📐 **CHOCH ਲੈਵਲ:** `{last_LH:.5f}`\n"
-          f"📊 **ਸਥਿਤੀ:** ਬ੍ਰੇਕਆਉਟ ਤੋਂ ਬਾਅਦ ਸਪੋਰਟ 'ਤੇ ਰੀਟੈਸਟ/ਹੋਲਡ!\n"
+          f"📊 **ਪੈਟਰਨ:** ਬ੍ਰੇਕਆਉਟ ਤੋਂ ਬਾਅਦ ਰੀਟੈਸਟ/ਹੋਲਡ (Point C)!\n"
           f"⚡ *ਵੱਡੇ ਪੰਪ ਤੋਂ ਪਹਿਲਾਂ ਦੀ ਸਹੀ ਐਂਟਰੀ ਜ਼ੋਨ!*"
       )
 
