@@ -34,14 +34,33 @@ for sym in symbols:
         down = df.iloc[-70:-10]
         down_pct = (down['c'] < down['c'].ewm(span=20).mean()).mean()*100
         if down_pct < 65: continue
-        swing_high = down['h'].max()
-        if close.iloc[-15:].max() <= swing_high: continue
-        if not (e6>e12>e20): continue
-        touched = (l <= e12*1.015 and l >= e12*0.96) or (l <= e20*1.03 and l >= e20*0.93)
-        if touched and c>e12 and c>o:
-            coin=sym.replace('/USDT:USDT','')
-            msg=f"🚀 LONG 4H CHOCH+EMA HOLD\nCoin:{coin}\nPrice:{c}\nEMA12:{e12:.6f} EMA20:{e20:.6f}\nSetup:Down->CHOCH->{swing_high:.4f} Break->EMA HOLD"
-            alerts.append(msg)
+                    swing_high = down['h'].max()
+            # --- FIX: Only fresh CHOCH ---
+            recent_max = close.iloc[-15:].max()
+            if recent_max <= swing_high: 
+                continue
+            # Check if breakout happened in LAST 2 candles (fresh)
+            broke_now = c > swing_high
+            broke_2ago = close.iloc[-2] > swing_high
+            broke_3ago = close.iloc[-3] > swing_high
+            # If it broke more than 2 candles ago, it's OLD - skip
+            if not broke_now:
+                continue
+            if broke_2ago and broke_3ago:
+                # Already broke 2 candles ago - old alert, skip
+                continue
+            # Don't alert if already pumped 12% above CHOCH (too late)
+            if c > swing_high * 1.12:
+                continue
+            
+            if not (e6>e12>e20): continue
+            touched = (l <= e12*1.015 and l >= e12*0.985) or (l <= e20*1.015 and l >= e20*0.985)
+            if touched and c>e12 and c>o:
+                coin=sym.replace('/USDT:USDT','').replace('/USDT','')
+                # Price must be close to CHOCH level, not far
+                choch_dist = (c - swing_high)/swing_high * 100
+                msg=f"🚀 LONG 4H CHOCH+EMA HOLD\nCoin:{coin} Price:{c:.6f} \nSetup:Down->{swing_high:.6f} Break->EMA HOLD | Fresh:{choch_dist:.1f}%"
+                alerts.append(msg)
         time.sleep(0.07)
     except: continue
 
