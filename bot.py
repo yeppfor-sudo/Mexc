@@ -136,9 +136,7 @@ def run_scanner():
       # -------------------------------------------------------------
       # 3. Lower TF (30m / 1h) Retest & Support Hold Check (No Big Pump Yet)
       # -------------------------------------------------------------
-      ohlcv_lower = exchange.fetch_ohlcv(
-          sym, "30m", limit=50
-      )  -- ਵੀ 1h ਜਾਂ 30m ਵਰਤ ਸਕਦੇ ਹਾਂ
+      ohlcv_lower = exchange.fetch_ohlcv(sym, "30m", limit=50)
       if len(ohlcv_lower) < 40:
         continue
 
@@ -156,12 +154,12 @@ def run_scanner():
       ema_max_l = max(ema6_l, ema12_l, ema20_l)
       ema_min_l = min(ema6_l, ema12_l, ema20_l)
 
-      # ਪ੍ਰਾਈਸ 30m/1h ਦੇ EMA ਕਲੱਸਟਰ ਦੇ ਬਹੁਤ ਕਰੀਬ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ (ਹੋਲਡ ਕਰਦੀ ਹੋਈ)
+      # ਪ੍ਰਾਈਸ 30m ਦੇ EMA ਕਲੱਸਟਰ ਦੇ ਬਹੁਤ ਕਰੀਬ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ (ਹੋਲਡ ਕਰਦੀ ਹੋਈ)
       retest_dist = abs(c_low - ema_max_l) / ema_max_l * 100
       if retest_dist > 2.5:
         continue  # ਰੀਟੈਸਟ ਜ਼ੋਨ ਵਿੱਚ ਨਹੀਂ ਹੈ
 
-      # ਸ਼ਰਤ: "Not Big Pump Yet" -> ਪਿਛਲੀਆਂ ਕੁਝ ਕੈਂਡਲਾਂ ਵਿੱਚ ਪ੍ਰਾਈਸ EMA ਤੋਂ ਬਹੁਤ ਉੱਪਰ ਨਾ ਗਈ ਹੋਵੇ (ਕੋਈ ਵੱਡਾ ਪੰਪ ਨਾ ਆਇਆ ਹੋਵੇ)
+      # ਸ਼ਰਤ: "Not Big Pump Yet" -> ਪਿਛਲੀਆਂ ਕੁਝ ਕੈਂਡਲਾਂ ਵਿੱਚ ਪ੍ਰਾਈਸ EMA ਤੋਂ ਬਹੁਤ ਉੱਪਰ ਨਾ ਗਈ ਹੋਵੇ
       recent_max_gain = (
           (high_low.iloc[-8:].max() - ema_min_l) / ema_min_l * 100
       )
