@@ -6,22 +6,22 @@ import ccxt
 import pandas as pd
 import requests
 
-# Telegram Configuration via Environment Variables
+# ਟੈਲੀਗ੍ਰਾਮ ਕੌਂਫਿਗਰੇਸ਼ਨ
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("CHAT_ID")
-STATE_FILE = "alerted_4h_red_retest.json"
+STATE_FILE = "alerted_4h_choh_retest.json"
 
 
 def send_telegram(msg):
   if not TOKEN or not CHAT:
-    print("❌ Telegram TOKEN or CHAT_ID missing.")
+    print("❌ Telegram TOKEN ਜਾਂ CHAT_ID ਨਹੀਂ ਮਿਲਿਆ।")
     return
   try:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT, "text": msg, "parse_mode": "Markdown"}
     requests.post(url, json=payload, timeout=10)
   except Exception as e:
-    print(f"❌ Telegram send error: {e}")
+    print(f"❌ Telegram ਭੇਜਣ ਵਿੱਚ ਗਲਤੀ: {e}")
 
 
 def load_state():
@@ -43,11 +43,10 @@ def save_state(d):
 
 
 def run_scanner():
-  print("🚀 Initializing MEXC Exchange & Loading Markets...")
+  print("🚀 MEXC ਐਕਸਚੇਂਜ ਲੋਡ ਹੋ ਰਹੀ ਹੈ...")
   exchange = ccxt.mexc({"enableRateLimit": True})
   exchange.load_markets()
 
-  # Filter perpetual futures pairs, excluding fiat/stocks
   EXCLUDE = [
       "STOCK",
       "JPY",
@@ -71,7 +70,7 @@ def run_scanner():
   alerted = load_state()
   now = datetime.now(timezone.utc)
 
-  # Clean up old alert history (keep for 4 days)
+  # ਪੁਰਾਣੇ ਅਲਰਟ 4 ਦਿਨਾਂ ਬਾਅਦ ਸਾਫ਼ ਕਰੋ
   alerted = {
       k: v
       for k, v in alerted.items()
@@ -79,7 +78,7 @@ def run_scanner():
   }
 
   TF = "4h"
-  print(f"🔍 Scanning {len(syms)} pairs on Timeframe: {TF} (Red Retest)...")
+  print(f"🔍 4 ਘੰਟੇ (4h) ਟਾਈਮਫ੍ਰੇਮ ਸਕੈਨ ਕੀਤਾ ਜਾ ਰਿਹਾ ਹੈ...")
   alert_count = 0
 
   for sym in syms:
@@ -88,114 +87,104 @@ def run_scanner():
       if key in alerted:
         continue
 
-      # Fetch OHLCV data for 4h timeframe (need slightly more data for strict volume check)
       ohlcv = exchange.fetch_ohlcv(sym, TF, limit=120)
       if len(ohlcv) < 90:
         continue
 
       df = pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
-      df = df.iloc[
-          :-1
-      ]  # Drop the active/incomplete candle to avoid false triggers
-      
-      # Candle components
-      close = df["c"]
-      open_ = df["o"]
-      high = df["h"]
-      low = df["l"]
-      volume = df["v"]
-      
-      # Data for calculations
-      c_last = close.iloc[-1]
-      o_last = open_.iloc[-1]
+      df = df.iloc[:-1]  # ਮੌਜੂਦਾ ਚੱਲ ਰਹੀ ਕੈਂਡਲ ਨੂੰ ਛੱਡੋ
 
-      # Calculate EMAs (Matching your chart: EMA 6, EMA 12, EMA 20)
+      close, open_, high, low, volume = (
+          df["c"],
+          df["o"],
+          df["h"],
+          df["l"],
+          df["v"],
+      )
+
+      # EMA ਕੈਲਕੁਲੇਸ਼ਨ (EMA 6, 12, 20)
       ema6 = close.ewm(span=6).mean()
       ema12 = close.ewm(span=12).mean()
       ema20 = close.ewm(span=20).mean()
 
-      e6 = ema6.iloc[-1]
-      e12 = ema12.iloc[-1]
-      e20 = ema20.iloc[-1]
+      e6, e12, e20 = ema6.iloc[-1], ema12.iloc[-1], ema20.iloc[-1]
 
-      # --- STRUCTURAL FILTERS (PRE-RETEST) ---
-
-      # 1. Check for valid breakout momentum (Green candles leading into retest)
-      # Looking back 3-10 candles before the current retest candle
-      momentum_check = (close.iloc[-10:-3] > open_.iloc[-10:-3]).mean()
-      if momentum_check < 0.6:  # At least 60% green candles in recent breakout
+      # 1. ਬੇਸ / ਡਾਊਨਟਰੈਂਡ ਚੈੱਕ (ਪੁਰਾਣੀ ਰੇਂਜ)
+      base_check = (ema6.iloc[-50:-15] < ema12.iloc[-50:-15]).mean()
+      if base_check < 0.50:
         continue
 
-      # 2. EMA Bullish Trend Alignment (e6 > e12 > e20)
-      if not (e6 > e12 > e20):
+      # 2. CHOCH ਲੈਵਲ (ਪਿਛਲਾ ਸਭ ਤੋਂ ਉੱਚਾ ਸਵਿੰਗ ਹਾਈ)
+      last_LH = df.iloc[-65:-15]["h"].max()
+
+      # 3. CHOCH ਬ੍ਰੇਕਆਉਟ ਚੈੱਕ (ਵਾਲਿਊਮ ਸਪਾਈਕ ਨਾਲ ਬ੍ਰੇਕਆਉਟ)
+      breakout_found = False
+      breakout_idx = -1
+
+      for i in range(-6, -1):
+        h_i, c_i, o_i, v_i = (
+            high.iloc[i],
+            close.iloc[i],
+            open_.iloc[i],
+            volume.iloc[i],
+        )
+        avg_v = volume.iloc[i - 25 : i].mean()
+
+        if h_i > last_LH and c_i > o_i and v_i > avg_v * 2.0:
+          breakout_found = True
+          breakout_idx = i
+          break
+
+      if not breakout_found:
         continue
 
-      # --- STRICT RED RETEST CANDLE FILTERS ---
+      # 4. ਰੀਟੈਸਟ (Zone A) ਚੈੱਕ: ਪ੍ਰਾਈਸ ਹੌਲੀ-ਹੌਲੀ ਵਾਪਸ ਸਪੋਰਟ 'ਤੇ ਆਵੇ
+      c_last = close.iloc[-1]
+      o_last = open_.iloc[-1]
 
-      # 3. Candle MUST be RED (Close < Open)
-      if not (c_last < o_last):
+      # ਰੀਟੈਸਟ ਕੈਂਡਲ ਛੋਟੀ ਜਾਂ ਰੈੱਡ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ (ਹੋਲਡਿੰਗ ਫੇਜ਼)
+      # EMA ਕਲੱਸਟਰ (Zone A) ਦੇ ਬਹੁਤ ਨੇੜੇ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ
+      ema_min = min(e6, e12, e20)
+      ema_max = max(e6, e12, e20)
+
+      # ਪ੍ਰਾਈਸ ਪ੍ਰੋਕਸੀਮੀਟੀ (Zone A ਵਿੱਚ)
+      retest_dist = abs(c_last - ema_max) / ema_max * 100
+      if retest_dist > 3.0:
         continue
 
-      # 4. 'Zone A' EMA Support Cluster Check:
-      # The red candle's body (Close and Open) must be tightly hugging the EMA group.
-      ema_cluster_min = min(e6, e12, e20)
-      ema_cluster_max = max(e6, e12, e20)
-
-      # Check proximity to EMA cluster (e.g., within 2.5% of the cluster range)
-      body_to_ema_prox = abs(c_last - ema_cluster_max) / ema_cluster_max * 100
-      if body_to_ema_prox > 2.5:
-        continue
-      
-      # 5. Volatility / Candle Size Check (Doji-like)
-      # The candle must have low volatility (small body and small range), indicating compression.
-      avg_range_pct = (
-          (high.iloc[-30:] - low.iloc[-30:]) / low.iloc[-30:] * 100
-      ).mean()
-      current_range_pct = (high.iloc[-1] - low.iloc[-1]) / low.iloc[-1] * 100
-      
-      if current_range_pct > avg_range_pct * 0.9:  # Candle range is below or near average
-          pass # This is fine for compression
-      
-      # Ensure it's not a large red "engulfing" candle
-      candle_body_pct = abs(c_last - o_last) / o_last * 100
-      if candle_body_pct > 1.8:  # Body must be relatively small
-          continue
-
-      # 6. Strict Volume Decline Check
-      # The volume on this red retest candle must be lower than the volume on preceding bullish candles.
-      prev_vol_avg = volume.iloc[-6:-2].mean()
+      # ਵਾਲਿਊਮ ਰੀਟੈਸਟ ਵੇਲੇ ਘੱਟ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ (ਡਰਾਈ ਅੱਪ)
+      breakout_vol = volume.iloc[breakout_idx]
       current_vol = volume.iloc[-1]
-      
-      # Retest volume should be declining (e.g., less than 70% of avg volume during breakout move)
-      if current_vol > prev_vol_avg * 0.70:
+      if current_vol > breakout_vol * 0.65:
+        continue
+
+      # EMA ਬੁੱਲਿਸ਼ ਅਲਾਈਨਮੈਂਟ
+      if not (e6 > e12 > e20):
         continue
 
       coin = sym.replace("/USDT:USDT", "")
 
-      # Construct Alert Message specifically for RED RETEST
+      # ਟੈਲੀਗ੍ਰਾਮ ਸੁਨੇਹਾ
       msg = (
-          f"🚨 **4H RED RETEST DETECTED [PRE-PUMP]** 🚨\n\n"
-          f"🪙 **Coin:** `{coin}`\n"
-          f"💲 **Current Price (Zone A):** `{c_last:.5f}`\n"
-          f"🔴 **Action:** Retesting EMA Support on a Small Red Candle\n"
-          f"📊 **Volume:** Declining (`{current_vol:.0f}` vs `{prev_vol_avg:.0f}` avg)\n"
-          f"📈 **Trend:** EMAs Bullishly Aligned\n\n"
-          f"⚡ *Ready for potential pump! Watch for volume spike confirmation.*"
+          f"🚨 **4H CHOCH + ZONE A RETEST [ਅਲਰਟ]** 🚨\n\n"
+          f"🪙 **ਕੋਇਨ:** `{coin}`\n"
+          f"💲 **ਪ੍ਰਾਈਸ (Zone A):** `{c_last:.5f}`\n"
+          f"📐 **CHOCH ਲੈਵਲ:** `{last_LH:.5f}`\n"
+          f"📊 **ਸਥਿਤੀ:** ਬ੍ਰੇਕਆਉਟ ਤੋਂ ਬਾਅਦ ਸਪੋਰਟ 'ਤੇ ਰੀਟੈਸਟ/ਹੋਲਡ!\n"
+          f"⚡ *ਵੱਡੇ ਪੰਪ ਤੋਂ ਪਹਿਲਾਂ ਦੀ ਸਹੀ ਐਂਟਰੀ ਜ਼ੋਨ!*"
       )
 
       send_telegram(msg)
-      print(f"✅ Red Retest alert sent for {coin} at price {c_last}")
+      print(f"✅ ਅਲਰਟ ਭੇਜਿਆ ਗਿਆ: {coin} ਪ੍ਰਾਈਸ: {c_last}")
       alerted[key] = now.isoformat()
       alert_count += 1
-      time.sleep(0.5)  # Rate limit protection
+      time.sleep(0.5)
 
     except Exception as e:
-      # Uncomment for debugging errors on specific pairs
-      # print(f"Error scanning {sym}: {e}")
       continue
 
   save_state(alerted)
-  print(f"🏁 Red Retest scan complete. Total alerts sent: {alert_count}")
+  print(f"🏁 ਸਕੈਨ ਪੂਰਾ ਹੋਇਆ। ਕੁੱਲ ਅਲਰਟ: {alert_count}")
 
 
 if __name__ == "__main__":
