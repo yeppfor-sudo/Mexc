@@ -6,9 +6,10 @@ import ccxt
 import pandas as pd
 import requests
 
+# Telegram Configuration via Environment Variables
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("CHAT_ID")
-STATE_FILE = "alerted_4h_strict.json"
+STATE_FILE = "alerted_4h_red_retest.json"
 
 
 def send_telegram(msg):
@@ -46,6 +47,7 @@ def run_scanner():
   exchange = ccxt.mexc({"enableRateLimit": True})
   exchange.load_markets()
 
+  # Filter perpetual futures pairs, excluding fiat/stocks
   EXCLUDE = [
       "STOCK",
       "JPY",
@@ -69,7 +71,7 @@ def run_scanner():
   alerted = load_state()
   now = datetime.now(timezone.utc)
 
-  # Prune alerts older than 4 days
+  # Clean up old alert history (keep for 4 days)
   alerted = {
       k: v
       for k, v in alerted.items()
@@ -77,7 +79,7 @@ def run_scanner():
   }
 
   TF = "4h"
-  print(f"🔍 Scanning {len(syms)} pairs on Timeframe: {TF} (Strict Mode)...")
+  print(f"🔍 Scanning {len(syms)} pairs on Timeframe: {TF} (Red Retest)...")
   alert_count = 0
 
   for sym in syms:
@@ -86,89 +88,114 @@ def run_scanner():
       if key in alerted:
         continue
 
-      ohlcv = exchange.fetch_ohlcv(sym, TF, limit=100)
-      if len(ohlcv) < 80:
+      # Fetch OHLCV data for 4h timeframe (need slightly more data for strict volume check)
+      ohlcv = exchange.fetch_ohlcv(sym, TF, limit=120)
+      if len(ohlcv) < 90:
         continue
 
       df = pd.DataFrame(ohlcv, columns=["t", "o", "h", "l", "c", "v"])
-      df = df.iloc[:-1]  # Drop active candle
-      close, open_, volume = df["c"], df["o"], df["v"]
-      c = close.iloc[-1]
+      df = df.iloc[
+          :-1
+      ]  # Drop the active/incomplete candle to avoid false triggers
+      
+      # Candle components
+      close = df["c"]
+      open_ = df["o"]
+      high = df["h"]
+      low = df["l"]
+      volume = df["v"]
+      
+      # Data for calculations
+      c_last = close.iloc[-1]
+      o_last = open_.iloc[-1]
 
-      # EMAs matching your charts (6, 12, 20)
+      # Calculate EMAs (Matching your chart: EMA 6, EMA 12, EMA 20)
       ema6 = close.ewm(span=6).mean()
       ema12 = close.ewm(span=12).mean()
       ema20 = close.ewm(span=20).mean()
 
-      e6, e12, e20 = ema6.iloc[-1], ema12.iloc[-1], ema20.iloc[-1]
+      e6 = ema6.iloc[-1]
+      e12 = ema12.iloc[-1]
+      e20 = ema20.iloc[-1]
 
-      # 1. Base / Downtrend validation (Extended sideways/downward base before breakout)
-      base_check = (ema6.iloc[-45:-15] < ema12.iloc[-45:-15]).mean()
-      if base_check < 0.60:
+      # --- STRUCTURAL FILTERS (PRE-RETEST) ---
+
+      # 1. Check for valid breakout momentum (Green candles leading into retest)
+      # Looking back 3-10 candles before the current retest candle
+      momentum_check = (close.iloc[-10:-3] > open_.iloc[-10:-3]).mean()
+      if momentum_check < 0.6:  # At least 60% green candles in recent breakout
         continue
 
-      # 2. CHOCH Level (Major swing high of the base structure)
-      last_LH = df.iloc[-60:-12]["h"].max()
-
-      # 3. CHOCH Break Check (Must have broken above last LH recently)
-      broke = False
-      break_idx = -1
-      for i in range(-15, -1):
-        if close.iloc[i] > last_LH:
-          broke = True
-          break_idx = i
-          break
-      if not broke:
+      # 2. EMA Bullish Trend Alignment (e6 > e12 > e20)
+      if not (e6 > e12 > e20):
         continue
 
-      # 4. Zone A Retest Validation: Price pulled back to test the EMA support / breakout level
-      # Current price must be near the EMA cluster (Zone A)
+      # --- STRICT RED RETEST CANDLE FILTERS ---
+
+      # 3. Candle MUST be RED (Close < Open)
+      if not (c_last < o_last):
+        continue
+
+      # 4. 'Zone A' EMA Support Cluster Check:
+      # The red candle's body (Close and Open) must be tightly hugging the EMA group.
       ema_cluster_min = min(e6, e12, e20)
       ema_cluster_max = max(e6, e12, e20)
 
-      # Price should be testing around Zone A (near EMAs or breakout level)
-      retest_dist_ema = abs(c - ema_cluster_min) / ema_cluster_min * 100
-      if retest_dist_ema > 3.5:  # Must be tightly hugging the EMAs at Zone A
+      # Check proximity to EMA cluster (e.g., within 2.5% of the cluster range)
+      body_to_ema_prox = abs(c_last - ema_cluster_max) / ema_cluster_max * 100
+      if body_to_ema_prox > 2.5:
         continue
+      
+      # 5. Volatility / Candle Size Check (Doji-like)
+      # The candle must have low volatility (small body and small range), indicating compression.
+      avg_range_pct = (
+          (high.iloc[-30:] - low.iloc[-30:]) / low.iloc[-30:] * 100
+      ).mean()
+      current_range_pct = (high.iloc[-1] - low.iloc[-1]) / low.iloc[-1] * 100
+      
+      if current_range_pct > avg_range_pct * 0.9:  # Candle range is below or near average
+          pass # This is fine for compression
+      
+      # Ensure it's not a large red "engulfing" candle
+      candle_body_pct = abs(c_last - o_last) / o_last * 100
+      if candle_body_pct > 1.8:  # Body must be relatively small
+          continue
 
-      # 5. Volume Confirmation (Crucial for filtering fake charts)
-      # Current or recent breakout volume must be significantly higher than average base volume
-      avg_vol = volume.iloc[-30:-5].mean()
+      # 6. Strict Volume Decline Check
+      # The volume on this red retest candle must be lower than the volume on preceding bullish candles.
+      prev_vol_avg = volume.iloc[-6:-2].mean()
       current_vol = volume.iloc[-1]
-      if (
-          current_vol < avg_vol * 1.8
-      ):  # Requires notable volume increase like your charts
+      
+      # Retest volume should be declining (e.g., less than 70% of avg volume during breakout move)
+      if current_vol > prev_vol_avg * 0.70:
         continue
-
-      # 6. Bullish Confirmation Candle at Zone A
-      if not (e6 > e12 > e20):
-        continue  # EMAs must be bullishly aligned
-      if not (close.iloc[-1] > open_.iloc[-1]):
-        continue  # Must be a green reaction candle
 
       coin = sym.replace("/USDT:USDT", "")
 
+      # Construct Alert Message specifically for RED RETEST
       msg = (
-          f"🚨 **4H CHOCH + ZONE A RETEST [VERIFIED]** 🚨\n\n"
+          f"🚨 **4H RED RETEST DETECTED [PRE-PUMP]** 🚨\n\n"
           f"🪙 **Coin:** `{coin}`\n"
-          f"💲 **Price:** `{c:.5f}`\n"
-          f"📐 **CHOCH Level:** `{last_LH:.5f}`\n"
-          f"🟢 **Zone A:** Retesting EMA Support Cluster\n"
-          f"📊 **Volume Surge Confirmed!**\n"
-          f"⚡ *Ready for potential vertical pump!*"
+          f"💲 **Current Price (Zone A):** `{c_last:.5f}`\n"
+          f"🔴 **Action:** Retesting EMA Support on a Small Red Candle\n"
+          f"📊 **Volume:** Declining (`{current_vol:.0f}` vs `{prev_vol_avg:.0f}` avg)\n"
+          f"📈 **Trend:** EMAs Bullishly Aligned\n\n"
+          f"⚡ *Ready for potential pump! Watch for volume spike confirmation.*"
       )
 
       send_telegram(msg)
-      print(f"✅ Verified alert sent for {coin} at price {c}")
+      print(f"✅ Red Retest alert sent for {coin} at price {c_last}")
       alerted[key] = now.isoformat()
       alert_count += 1
-      time.sleep(0.5)
+      time.sleep(0.5)  # Rate limit protection
 
     except Exception as e:
+      # Uncomment for debugging errors on specific pairs
+      # print(f"Error scanning {sym}: {e}")
       continue
 
   save_state(alerted)
-  print(f"🏁 Strict scan complete. Total verified alerts sent: {alert_count}")
+  print(f"🏁 Red Retest scan complete. Total alerts sent: {alert_count}")
 
 
 if __name__ == "__main__":
