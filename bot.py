@@ -8,7 +8,7 @@ import requests
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("CHAT_ID")
-STATE_FILE = "alerted_ema20_cooldown.json"
+STATE_FILE = "alerted_sl_tp_cooldown.json"
 
 
 def send_telegram(msg):
@@ -43,7 +43,7 @@ def save_state(d):
 
 def run_scanner():
   print(
-      "🚀 Starting MEXC Scanner (1D Downtrend -> 1h CHOCH -> EMA 20 Retest Hold)"
+      "🚀 Starting MEXC Scanner (Downtrend -> CHOCH -> EMA 20 Retest + SL/TP/RR)"
       "..."
   )
   exchange = ccxt.mexc({"enableRateLimit": True})
@@ -84,7 +84,7 @@ def run_scanner():
 
   for sym in syms:
     try:
-      key = f"{sym}_ema20_retest"
+      key = f"{sym}_sl_tp_retest"
       if key in alerted:
         continue  # Skip if already alerted in the last 24 hours
 
@@ -100,7 +100,6 @@ def run_scanner():
       ema20_1d = df_1d["c"].ewm(span=20).mean()
       ema50_1d = df_1d["c"].ewm(span=50).mean()
 
-      # Macro downtrend structure
       if (ema20_1d.iloc[-25:-5] < ema50_1d.iloc[-25:-5]).mean() < 0.45:
         continue
 
@@ -120,13 +119,13 @@ def run_scanner():
           df_1h["v"],
       )
 
-      # Swing high for 1h CHOCH level
-      last_LH = df_1h.iloc[-50:-10]["h"].max()
+      # Resistance level (1h CHOCH Swing High)
+      resistance_level = df_1h.iloc[-50:-10]["h"].max()
 
       breakout_found = False
       for i in range(-8, -1):
         if (
-            high_1h.iloc[i] > last_LH
+            high_1h.iloc[i] > resistance_level
             and close_1h.iloc[i] > open_1h.iloc[i]
             and volume_1h.iloc[i] > volume_1h.iloc[i - 20 : i].mean() * 1.5
         ):
@@ -136,7 +135,7 @@ def run_scanner():
         continue
 
       # -------------------------------------------------------------
-      # RULE 3: Lower TF (15m/30m) Retest & EMA 20 Support Hold Check
+      # RULE 3: Lower TF (15m) Retest & EMA 20 Support Hold Check
       # -------------------------------------------------------------
       ohlcv_lower = exchange.fetch_ohlcv(sym, "15m", limit=50)
       if len(ohlcv_lower) < 40:
@@ -149,18 +148,20 @@ def run_scanner():
 
       c_low = df_lower["c"].iloc[-1]
       high_low = df_lower["h"]
-      
-      # Calculate standard MEXC EMAs (6, 12, 20) on lower timeframe
+      low_low = df_lower["l"]
+
       ema6_l = df_lower["c"].ewm(span=6).mean().iloc[-1]
       ema12_l = df_lower["c"].ewm(span=12).mean().iloc[-1]
       ema20_l = df_lower["c"].ewm(span=20).mean().iloc[-1]
 
-      # Price must be holding tightly right around the EMA 20 support line
+      # Support level (Recent lower timeframe swing low)
+      support_level = low_low.iloc[-15:].min()
+
+      # Distance to EMA 20 support hold
       ema20_distance = abs(c_low - ema20_l) / ema20_l * 100
       if ema20_distance > 2.5:
-        continue  # Price is too far from EMA 20 support
+        continue
 
-      # Short-term bullish indicator alignment (EMA 6 > EMA 12 over EMA 20)
       if not (ema6_l > ema12_l):
         continue
 
@@ -171,24 +172,47 @@ def run_scanner():
           (high_low.iloc[-10:].max() - ema20_l) / ema20_l * 100
       )
       if recent_max_gain > 5.0:
-        continue  # Avoid chasing if already pumped > 5%
+        continue
+
+      # -------------------------------------------------------------
+      # TRADE MANAGEMENT: SL, TP, and R:R Calculation
+      # -------------------------------------------------------------
+      entry_price = c_low
+
+      # Stop Loss placed slightly below the recent support / swing low
+      stop_loss = min(support_level * 0.99, ema20_l * 0.985)
+      if stop_loss >= entry_price:
+        stop_loss = entry_price * 0.97  # Fallback safety buffer
+
+      risk = entry_price - stop_loss
+
+      # Target set aiming towards resistance or targeting a 1:2.5 minimum R:R
+      target_price = max(resistance_level, entry_price + (risk * 2.5))
+
+      reward = target_price - entry_price
+      rr_ratio = reward / risk if risk > 0 else 0.0
 
       coin = sym.replace("/USDT:USDT", "")
 
-      # Telegram Alert Message
+      # Telegram Alert Message with SL, TP, and R:R
       msg = (
-          f"🚨 **LONG SETUP: 1H CHOCH + EMA 20 RETEST** 🚨\n\n"
+          f"🚨 **LONG SETUP: CHOCH + EMA 20 RETEST** 🚨\n\n"
           f"🪙 **Coin:** `{coin}`\n"
           f"📉 **1D Trend:** Downtrend Base Verified\n"
           f"⚡ **1h Trend:** CHOCH Breakout Confirmed\n"
-          f"🎯 **Lower TF (15m):** Holding EMA 20 Support (No Big Pump Yet!)\n"
-          f"💲 **Current Price:** `{c_low:.5f}`\n"
-          f"📊 **EMA 20 Level:** `{ema20_l:.5f}`\n\n"
-          f"💡 *Ready for Long entry setup!* (24h Cooldown Active)"
+          f"🎯 **Lower TF (15m):** Holding EMA 20 Support\n\n"
+          f"📊 **Levels & Risk Management:**\n"
+          f"💲 **Entry Price:** `{entry_price:.5f}`\n"
+          f"🛡️ **Support (S):** `{support_level:.5f}`\n"
+          f"🚀 **Resistance (R):** `{resistance_level:.5f}`\n"
+          f"🛑 **Stop Loss (SL):** `{stop_loss:.5f}`\n"
+          f"🎯 **Target (TP):** `{target_price:.5f}`\n"
+          f"⚖️ **Risk-to-Reward (R:R):** `1:{rr_ratio:.2f}`\n\n"
+          f"💡 *Pre-pump retest zone detected!* (24h Cooldown Active)"
       )
 
       send_telegram(msg)
-      print(f"✅ Alert sent for {coin} at price {c_low} resting on EMA 20")
+      print(f"✅ Alert sent for {coin} | Entry: {entry_price} | R:R 1:{rr_ratio:.2f}")
       alerted[key] = now.isoformat()
       alert_count += 1
       time.sleep(0.5)
