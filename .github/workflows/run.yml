@@ -1,47 +1,17 @@
-name: MEXC Wedge Scanner
-
-on:
-  schedule:
-    - cron: '0 * * * *' # Runs automatically every hour. Change as needed.
-  workflow_dispatch: # Allows manual triggering from the Actions tab
-
-jobs:
-  run-scanner:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write # Needed to commit cooldown updates back to repo
-
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install ccxt requests
-
-      - name: Run Scanner Script
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python scanner.py
-
       - name: Commit & Push Cooldown Cache
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.io'
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git status
-          if git diff --quiet alerted_pairs.json; then
-            echo "No cache updates required."
-          else
+          if [ -f "alerted_pairs.json" ]; then
             git add alerted_pairs.json
-            git commit -m "chore: update 24h alert cooldown tracking [skip ci]"
-            git push
+            git commit -m "chore: update 24h alert cooldown tracking [skip ci]" || echo "No changes to commit"
+            git push || echo "Push skipped"
+          else
+            echo "Cache file not found, skipping commit."
           fi
         continue-on-error: true
+  
