@@ -2,14 +2,14 @@ name: MEXC Multi-Timeframe Wedge Scanner
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # Runs every 4 hours automatically
-  workflow_dispatch: # Allows manual trigger from Actions tab
+    - cron: '0 */4 * * *' # Runs automatically every 4 hours
+  workflow_dispatch: # Allows manual triggering from the Actions tab
 
 jobs:
   run-scanner:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # Required to push cache updates back to the repo
 
     steps:
       - name: Checkout Repository
@@ -23,7 +23,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ccxt requests
+          pip install ccxt requests matplotlib
 
       - name: Run Scanner Script
         env:
@@ -48,9 +48,3 @@ jobs:
             echo "Cache file not found, skipping commit."
           fi
         continue-on-error: true
-
-              - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install ccxt requests matplotlib
-
