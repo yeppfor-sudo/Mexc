@@ -48,3 +48,9 @@ jobs:
             echo "Cache file not found, skipping commit."
           fi
         continue-on-error: true
+
+              - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ccxt requests matplotlib
+
