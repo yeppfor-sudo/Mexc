@@ -8,19 +8,19 @@ import requests
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("CHAT_ID")
-STATE_FILE = "alerted_strict_retest.json"
+STATE_FILE = "alerted_ema20_cooldown.json"
 
 
 def send_telegram(msg):
   if not TOKEN or not CHAT:
-    print("❌ Telegram TOKEN ਜਾਂ CHAT_ID ਨਹੀਂ ਮਿਲਿਆ।")
+    print("❌ Telegram TOKEN or CHAT_ID missing.")
     return
   try:
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT, "text": msg, "parse_mode": "Markdown"}
     requests.post(url, json=payload, timeout=10)
   except Exception as e:
-    print(f"❌ Telegram ਭੇਜਣ ਵਿੱਚ ਗਲਤੀ: {e}")
+    print(f"❌ Telegram send error: {e}")
 
 
 def load_state():
@@ -42,7 +42,10 @@ def save_state(d):
 
 
 def run_scanner():
-  print("🚀 MEXC ਐਕਸਚੇਂਜ ਪ੍ਰੀਮੀਅਮ ਸਕੈਨਿੰਗ ਸ਼ੁਰੂ ਹੋ ਗਈ ਹੈ...")
+  print(
+      "🚀 Starting MEXC Scanner (1D Downtrend -> 1h CHOCH -> EMA 20 Retest Hold)"
+      "..."
+  )
   exchange = ccxt.mexc({"enableRateLimit": True})
   exchange.load_markets()
 
@@ -69,64 +72,63 @@ def run_scanner():
   alerted = load_state()
   now = datetime.now(timezone.utc)
 
-  # ਪੁਰਾਣੇ ਅਲਰਟ 4 ਦਿਨਾਂ ਬਾਅਦ ਕਲੀਅਰ ਕਰੋ
+  # Rule: Only alert a pair once in 24h
   alerted = {
       k: v
       for k, v in alerted.items()
-      if datetime.fromisoformat(v) > now - timedelta(days=4)
+      if datetime.fromisoformat(v) > now - timedelta(hours=24)
   }
 
-  print(
-      f"🔍 {len(syms)} ਕੋਇਨਾਂ ਦਾ [1D Downtrend -> 4H CHOCH -> Lower TF Hold -> No"
-      " Pump Yet] ਸਕੈਨ ਚੱਲ ਰਿਹਾ ਹੈ..."
-  )
+  print(f"🔍 Scanning {len(syms)} pairs...")
   alert_count = 0
 
   for sym in syms:
     try:
-      key = f"{sym}_strict"
+      key = f"{sym}_ema20_retest"
       if key in alerted:
-        continue
+        continue  # Skip if already alerted in the last 24 hours
 
       # -------------------------------------------------------------
-      # 1. 1D (Daily) Timeframe Downtrend Check
+      # RULE 1: 1D (Daily) Timeframe Downtrend Check
       # -------------------------------------------------------------
-      ohlcv_1d = exchange.fetch_ohlcv(sym, "1d", limit=60)
+      ohlcv_1d = exchange.fetch_ohlcv(sym, "1d", limit=50)
       if len(ohlcv_1d) < 30:
         continue
 
       df_1d = pd.DataFrame(ohlcv_1d, columns=["t", "o", "h", "l", "c", "v"])
       df_1d = df_1d.iloc[:-1]
-      ema6_1d = df_1d["c"].ewm(span=6).mean()
-      ema12_1d = df_1d["c"].ewm(span=12).mean()
+      ema20_1d = df_1d["c"].ewm(span=20).mean()
+      ema50_1d = df_1d["c"].ewm(span=50).mean()
 
-      if (ema6_1d.iloc[-30:-5] < ema12_1d.iloc[-30:-5]).mean() < 0.45:
-        continue  # 1D ਡਾਊਨਟਰੈਂਡ ਵਿੱਚ ਹੋਣਾ ਚਾਹੀਦਾ ਹੈ
-
-      # -------------------------------------------------------------
-      # 2. 4H Timeframe CHOCH Breakout Check
-      # -------------------------------------------------------------
-      ohlcv_4h = exchange.fetch_ohlcv(sym, "4h", limit=100)
-      if len(ohlcv_4h) < 70:
+      # Macro downtrend structure
+      if (ema20_1d.iloc[-25:-5] < ema50_1d.iloc[-25:-5]).mean() < 0.45:
         continue
 
-      df_4h = pd.DataFrame(ohlcv_4h, columns=["t", "o", "h", "l", "c", "v"])
-      df_4h = df_4h.iloc[:-1]
-      close_4h, high_4h, open_4h, volume_4h = (
-          df_4h["c"],
-          df_4h["h"],
-          df_4h["o"],
-          df_4h["v"],
+      # -------------------------------------------------------------
+      # RULE 2: 1h Timeframe CHOCH Breakout Check
+      # -------------------------------------------------------------
+      ohlcv_1h = exchange.fetch_ohlcv(sym, "1h", limit=100)
+      if len(ohlcv_1h) < 60:
+        continue
+
+      df_1h = pd.DataFrame(ohlcv_1h, columns=["t", "o", "h", "l", "c", "v"])
+      df_1h = df_1h.iloc[:-1]
+      close_1h, high_1h, open_1h, volume_1h = (
+          df_1h["c"],
+          df_1h["h"],
+          df_1h["o"],
+          df_1h["v"],
       )
 
-      last_LH = df_4h.iloc[-60:-15]["h"].max()
+      # Swing high for 1h CHOCH level
+      last_LH = df_1h.iloc[-50:-10]["h"].max()
 
       breakout_found = False
-      for i in range(-6, -1):
+      for i in range(-8, -1):
         if (
-            high_4h.iloc[i] > last_LH
-            and close_4h.iloc[i] > open_4h.iloc[i]
-            and volume_4h.iloc[i] > volume_4h.iloc[i - 20 : i].mean() * 1.8
+            high_1h.iloc[i] > last_LH
+            and close_1h.iloc[i] > open_1h.iloc[i]
+            and volume_1h.iloc[i] > volume_1h.iloc[i - 20 : i].mean() * 1.5
         ):
           breakout_found = True
           break
@@ -134,9 +136,9 @@ def run_scanner():
         continue
 
       # -------------------------------------------------------------
-      # 3. Lower TF (30m / 1h) Retest & Support Hold Check (No Big Pump Yet)
+      # RULE 3: Lower TF (15m/30m) Retest & EMA 20 Support Hold Check
       # -------------------------------------------------------------
-      ohlcv_lower = exchange.fetch_ohlcv(sym, "30m", limit=50)
+      ohlcv_lower = exchange.fetch_ohlcv(sym, "15m", limit=50)
       if len(ohlcv_lower) < 40:
         continue
 
@@ -147,42 +149,46 @@ def run_scanner():
 
       c_low = df_lower["c"].iloc[-1]
       high_low = df_lower["h"]
+      
+      # Calculate standard MEXC EMAs (6, 12, 20) on lower timeframe
       ema6_l = df_lower["c"].ewm(span=6).mean().iloc[-1]
       ema12_l = df_lower["c"].ewm(span=12).mean().iloc[-1]
       ema20_l = df_lower["c"].ewm(span=20).mean().iloc[-1]
 
-      ema_max_l = max(ema6_l, ema12_l, ema20_l)
-      ema_min_l = min(ema6_l, ema12_l, ema20_l)
+      # Price must be holding tightly right around the EMA 20 support line
+      ema20_distance = abs(c_low - ema20_l) / ema20_l * 100
+      if ema20_distance > 2.5:
+        continue  # Price is too far from EMA 20 support
 
-      # ਪ੍ਰਾਈਸ 30m ਦੇ EMA ਕਲੱਸਟਰ ਦੇ ਬਹੁਤ ਕਰੀਬ ਹੋਣੀ ਚਾਹੀਦੀ ਹੈ (ਹੋਲਡ ਕਰਦੀ ਹੋਈ)
-      retest_dist = abs(c_low - ema_max_l) / ema_max_l * 100
-      if retest_dist > 2.5:
-        continue  # ਰੀਟੈਸਟ ਜ਼ੋਨ ਵਿੱਚ ਨਹੀਂ ਹੈ
-
-      # ਸ਼ਰਤ: "Not Big Pump Yet" -> ਪਿਛਲੀਆਂ ਕੁਝ ਕੈਂਡਲਾਂ ਵਿੱਚ ਪ੍ਰਾਈਸ EMA ਤੋਂ ਬਹੁਤ ਉੱਪਰ ਨਾ ਗਈ ਹੋਵੇ
-      recent_max_gain = (
-          (high_low.iloc[-8:].max() - ema_min_l) / ema_min_l * 100
-      )
-      if (
-          recent_max_gain > 7.0
-      ):  # ਜੇ 7% ਤੋਂ ਵੱਧ ਪੰਪ ਆ ਚੁੱਕਿਆ ਹੈ, ਤਾਂ ਅਲਰਟ ਨਾ ਭੇਜੋ
+      # Short-term bullish indicator alignment (EMA 6 > EMA 12 over EMA 20)
+      if not (ema6_l > ema12_l):
         continue
+
+      # -------------------------------------------------------------
+      # RULE 4: Not a Big Pump Yet Check
+      # -------------------------------------------------------------
+      recent_max_gain = (
+          (high_low.iloc[-10:].max() - ema20_l) / ema20_l * 100
+      )
+      if recent_max_gain > 5.0:
+        continue  # Avoid chasing if already pumped > 5%
 
       coin = sym.replace("/USDT:USDT", "")
 
-      # ਟੈਲੀਗ੍ਰਾਮ ਅਲਰਟ ਸੁਨੇਹਾ
+      # Telegram Alert Message
       msg = (
-          f"🚨 **PRE-PUMP RETEST ALERT (POINT C)** 🚨\n\n"
-          f"🪙 **ਕੋਇਨ:** `{coin}`\n"
+          f"🚨 **LONG SETUP: 1H CHOCH + EMA 20 RETEST** 🚨\n\n"
+          f"🪙 **Coin:** `{coin}`\n"
           f"📉 **1D Trend:** Downtrend Base Verified\n"
-          f"⚡ **4H Trend:** CHOCH Breakout Confirmed\n"
-          f"🎯 **Lower TF (30m):** Holding EMA Support (No Pump Yet!)\n"
-          f"💲 **Current Price:** `{c_low:.5f}`\n\n"
-          f"⚡ *ਪ੍ਰਾਈਸ ਬਿਲਕੁਲ ਐਂਟਰੀ ਜ਼ੋਨ 'ਤੇ ਹੈ, ਵੱਡੇ ਪੰਪ ਤੋਂ ਪਹਿਲਾਂ ਚੈੱਕ ਕਰੋ!*"
+          f"⚡ **1h Trend:** CHOCH Breakout Confirmed\n"
+          f"🎯 **Lower TF (15m):** Holding EMA 20 Support (No Big Pump Yet!)\n"
+          f"💲 **Current Price:** `{c_low:.5f}`\n"
+          f"📊 **EMA 20 Level:** `{ema20_l:.5f}`\n\n"
+          f"💡 *Ready for Long entry setup!* (24h Cooldown Active)"
       )
 
       send_telegram(msg)
-      print(f"✅ ਪਰਫੈਕਟ ਪ੍ਰੀ-ਪੰਪ ਅਲਰਟ ਭੇਜਿਆ ਗਿਆ: {coin}")
+      print(f"✅ Alert sent for {coin} at price {c_low} resting on EMA 20")
       alerted[key] = now.isoformat()
       alert_count += 1
       time.sleep(0.5)
@@ -191,7 +197,7 @@ def run_scanner():
       continue
 
   save_state(alerted)
-  print(f"🏁 ਸਕੈਨ ਪੂਰਾ ਹੋਇਆ। ਕੁੱਲ ਅਲਰਟ: {alert_count}")
+  print(f"🏁 Scan complete. Total alerts sent: {alert_count}")
 
 
 if __name__ == "__main__":
