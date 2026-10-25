@@ -3,11 +3,15 @@ import time
 import json
 import ccxt
 import requests
+import matplotlib
+matplotlib.use('Agg') # Headless backend for server environments
+import matplotlib.pyplot as plt
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CACHE_FILE = "alerted_pairs.json"
 COOLDOWN_HOURS = 24
+CHART_FILE = "chart.png"
 
 def send_telegram_alert(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -22,9 +26,29 @@ def send_telegram_alert(message):
     try:
         response = requests.post(url, json=payload)
         response.raise_for_status()
-        print("Telegram alert sent successfully.")
+        print("Telegram status message sent successfully.")
     except Exception as e:
-        print(f"Failed to send Telegram alert: {e}")
+        print(f"Failed to send Telegram status message: {e}")
+
+def send_telegram_photo_alert(message, chart_path):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram credentials missing.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    
+    try:
+        with open(chart_path, 'rb') as photo:
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "caption": message,
+                "parse_mode": "Markdown"
+            }
+            files = {"photo": photo}
+            response = requests.post(url, data=payload, files=files)
+            response.raise_for_status()
+            print("Telegram photo alert sent successfully.")
+    except Exception as e:
+        print(f"Failed to send Telegram photo alert: {e}")
 
 def load_cache():
     if os.path.exists(CACHE_FILE):
@@ -60,15 +84,44 @@ def aggregate_candles(base_ohlcv, factor):
         aggregated.append([timestamp, open_price, high_price, low_price, close_price, volume])
     return aggregated
 
+def generate_chart(symbol, tf_name, ohlcv, entry, sl, tp):
+    """Generates and saves a clean candlestick chart image with SL/TP lines."""
+    try:
+        recent = ohlcv[-35:]
+        closes = [c[4] for c in recent]
+        highs = [c[2] for c in recent]
+        lows = [c[3] for c in recent]
+        x = range(len(recent))
+
+        plt.figure(figsize=(10, 6))
+        plt.style.use('dark_background')
+
+        plt.plot(x, closes, color='#00ffcc', linewidth=2, label='Close Price')
+        plt.fill_between(x, lows, highs, color='#00ffcc', alpha=0.15)
+
+        plt.axhline(y=entry, color='#3498db', linestyle='--', linewidth=1.5, label=f'Entry: {entry:.4f}')
+        plt.axhline(y=sl, color='#e74c3c', linestyle='-', linewidth=1.5, label=f'Stop Loss: {sl:.4f}')
+        plt.axhline(y=tp, color='#2ecc71', linestyle='-', linewidth=1.5, label=f'Take Profit: {tp:.4f}')
+
+        plt.title(f"{symbol} - {tf_name} Setup", fontsize=14, color='white', pad=12)
+        plt.legend(loc='upper left', fontsize=9)
+        plt.grid(color='#333333', linestyle=':', linewidth=0.5)
+        plt.tight_layout()
+
+        plt.savefig(CHART_FILE, dpi=150)
+        plt.close()
+        return True
+    except Exception as e:
+        print(f"Chart generation error: {e}")
+        return False
+
 def analyze_tf_candles(symbol, tf_name, ohlcv):
     if len(ohlcv) < 30:
         return None
 
-    # Previous closed candle (index -2)
     prev_candle = ohlcv[-2]
     p_open, p_high, p_low, p_close, p_vol = prev_candle[1], prev_candle[2], prev_candle[3], prev_candle[4], prev_candle[5]
 
-    # 1. Solid Candle Filter (Bullish body >= 60% of total candle range)
     body_size = p_close - p_open
     total_range = p_high - p_low
     if total_range == 0:
@@ -79,7 +132,6 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     if not is_bullish or body_ratio < 0.6:
         return None
 
-    # 2. Volume Spike Filter (> 1.5x average of past 20 closed candles)
     history_vols = [c[5] for c in ohlcv[-22:-2]]
     if len(history_vols) < 20:
         return None
@@ -87,7 +139,6 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     if avg_vol == 0 or p_vol < avg_vol * 1.5:
         return None
 
-    # 3. Structure & Pattern Detection (Falling Wedge OR CHoCH)
     pattern_candles = ohlcv[-27:-2]
     if len(pattern_candles) < 20:
         return None
@@ -101,17 +152,14 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     fh_low_avg = sum(lows[:half]) / half
     sh_low_avg = sum(lows[half:]) / (len(lows) - half)
 
-    # Must have a preceding descending/contracting phase (downtrend context)
     is_prior_down = sh_high_avg <= fh_high_avg
     if not is_prior_down:
         return None
 
-    # Breakout level: Recent local swing high resistance
     local_resistance = max(highs[-12:-1])
     if p_close <= local_resistance:
         return None
 
-    # Classify pattern: Falling Wedge vs Bullish CHoCH (Change of Character)
     is_falling_lows = sh_low_avg < fh_low_avg
     is_contracting = (highs[-1] - lows[-1]) < (highs[0] - lows[0])
     
@@ -122,13 +170,12 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
         pattern_type = "Bullish CHoCH (Change of Character)"
         pattern_desc = "Price broke above the most recent lower high in a downtrend structure, signaling a character shift from bearish to bullish."
 
-    # 4. Risk / Reward Calculation (Min 1:2)
-    sl = min(lows[-12:])  # Stop loss placed below recent swing lows
+    sl = min(lows[-12:])
     risk = p_close - sl
     if risk <= 0:
         return None
 
-    tp = p_close + (risk * 2.5)  # Setting 1:2.5 ratio (satisfying minimum 1:2)
+    tp = p_close + (risk * 2.5)
     rr_ratio = (tp - p_close) / risk
     if rr_ratio < 2.0:
         return None
@@ -142,7 +189,8 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
         "body_ratio": body_ratio,
         "vol_ratio": p_vol / avg_vol,
         "pattern_type": pattern_type,
-        "pattern_desc": pattern_desc
+        "pattern_desc": pattern_desc,
+        "ohlcv": ohlcv
     }
 
 def main():
@@ -166,9 +214,6 @@ def main():
 
     cache = {sym: t for sym, t in cache.items() if (current_time - t) / 3600 < COOLDOWN_HOURS}
 
-    # Timeframes configuration: tuple of (Label, base_timeframe, aggregation_factor)
-    # 8h and 12h are built from 4h candles (2x 4h = 8h, 3x 4h = 12h)
-    # 1d, 3d, and weekly are built from 1d candles (1x = 1d, 3x = 3d, 7x = weekly)
     scan_targets = [
         ("8h", "4h", 2),
         ("12h", "4h", 3),
@@ -177,13 +222,14 @@ def main():
         ("Weekly (1W)", "1d", 7)
     ]
 
+    total_alerts_sent = 0
+
     for symbol in symbols:
         if symbol in cache:
             if (current_time - cache[symbol]) / 3600 < COOLDOWN_HOURS:
                 continue
 
         try:
-            # Fetch 4h and 1d source candles efficiently
             h4_ohlcv = exchange.fetch_ohlcv(symbol, '4h', limit=100)
             daily_ohlcv = exchange.fetch_ohlcv(symbol, '1d', limit=100)
 
@@ -199,6 +245,8 @@ def main():
 
                 setup = analyze_tf_candles(symbol, tf_label, tf_ohlcv)
                 if setup:
+                    chart_created = generate_chart(symbol, setup['timeframe'], setup['ohlcv'], setup['entry'], setup['sl'], setup['tp'])
+                    
                     message = (
                         f"🚀 *MEXC Perpetual Long Setup*\n\n"
                         f"🔹 *Pair:* `{symbol}`\n"
@@ -214,9 +262,14 @@ def main():
                         f"• **Volume Expansion:** Breakout volume surged to {setup['vol_ratio']:.1f}x the 20-period average, validating heavy institutional accumulation."
                     )
 
-                    send_telegram_alert(message)
+                    if chart_created and os.path.exists(CHART_FILE):
+                        send_telegram_photo_alert(message, CHART_FILE)
+                    else:
+                        send_telegram_photo_alert(message, None)
+
                     cache[symbol] = current_time
                     save_cache(cache)
+                    total_alerts_sent += 1
                     time.sleep(0.5)
                     found_alert = True
                     break
@@ -227,6 +280,11 @@ def main():
         except Exception as e:
             print(f"Error processing {symbol}: {e}")
             continue
+
+    # Send status update if no setups were found in this 4h cycle
+    if total_alerts_sent == 0:
+        status_msg = "🔍 *MEXC Scan Cycle Completed*\n\nNo pairs matched the Falling Wedge / CHoCH criteria in this 4h window.\n\n✅ *Scanner Status:* Active and working correctly!"
+        send_telegram_alert(status_msg)
 
 if __name__ == "__main__":
     main()
