@@ -43,12 +43,12 @@ def save_cache(cache):
     except Exception as e:
         print(f"Failed to save cache: {e}")
 
-def aggregate_candles(daily_ohlcv, period_days):
-    if not daily_ohlcv:
+def aggregate_candles(base_ohlcv, factor):
+    if not base_ohlcv:
         return []
     aggregated = []
-    for i in range(0, len(daily_ohlcv), period_days):
-        chunk = daily_ohlcv[i:i + period_days]
+    for i in range(0, len(base_ohlcv), factor):
+        chunk = base_ohlcv[i:i + factor]
         if not chunk:
             continue
         timestamp = chunk[0][0]
@@ -68,7 +68,7 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     prev_candle = ohlcv[-2]
     p_open, p_high, p_low, p_close, p_vol = prev_candle[1], prev_candle[2], prev_candle[3], prev_candle[4], prev_candle[5]
 
-    # Solid Candle Filter (Bullish body >= 60% of total range)
+    # 1. Solid Candle Filter (Bullish body >= 60% of total candle range)
     body_size = p_close - p_open
     total_range = p_high - p_low
     if total_range == 0:
@@ -79,7 +79,7 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     if not is_bullish or body_ratio < 0.6:
         return None
 
-    # Volume Spike Filter (> 1.5x average of past 20 closed candles)
+    # 2. Volume Spike Filter (> 1.5x average of past 20 closed candles)
     history_vols = [c[5] for c in ohlcv[-22:-2]]
     if len(history_vols) < 20:
         return None
@@ -87,7 +87,7 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     if avg_vol == 0 or p_vol < avg_vol * 1.5:
         return None
 
-    # Falling Wedge Structure Detection
+    # 3. Structure & Pattern Detection (Falling Wedge OR CHoCH)
     pattern_candles = ohlcv[-27:-2]
     if len(pattern_candles) < 20:
         return None
@@ -101,24 +101,34 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     fh_low_avg = sum(lows[:half]) / half
     sh_low_avg = sum(lows[half:]) / (len(lows) - half)
 
-    is_falling_highs = sh_high_avg < fh_high_avg
-    is_falling_lows = sh_low_avg < fh_low_avg
-    is_contracting = (highs[-1] - lows[-1]) < (highs[0] - lows[0])
-
-    if not (is_falling_highs and is_falling_lows and is_contracting):
+    # Must have a preceding descending/contracting phase (downtrend context)
+    is_prior_down = sh_high_avg <= fh_high_avg
+    if not is_prior_down:
         return None
 
-    local_resistance = max(highs[-10:])
+    # Breakout level: Recent local swing high resistance
+    local_resistance = max(highs[-12:-1])
     if p_close <= local_resistance:
         return None
 
-    # Risk / Reward Calculation (Min 1:2)
-    sl = min(lows[-10:])
+    # Classify pattern: Falling Wedge vs Bullish CHoCH (Change of Character)
+    is_falling_lows = sh_low_avg < fh_low_avg
+    is_contracting = (highs[-1] - lows[-1]) < (highs[0] - lows[0])
+    
+    if is_falling_lows and is_contracting:
+        pattern_type = "Falling Wedge Breakout"
+        pattern_desc = "Price broke above the upper boundary of a falling wedge consolidation channel, signaling trend reversal."
+    else:
+        pattern_type = "Bullish CHoCH (Change of Character)"
+        pattern_desc = "Price broke above the most recent lower high in a downtrend structure, signaling a character shift from bearish to bullish."
+
+    # 4. Risk / Reward Calculation (Min 1:2)
+    sl = min(lows[-12:])  # Stop loss placed below recent swing lows
     risk = p_close - sl
     if risk <= 0:
         return None
 
-    tp = p_close + (risk * 2.5)
+    tp = p_close + (risk * 2.5)  # Setting 1:2.5 ratio (satisfying minimum 1:2)
     rr_ratio = (tp - p_close) / risk
     if rr_ratio < 2.0:
         return None
@@ -130,7 +140,9 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
         "tp": tp,
         "rr": rr_ratio,
         "body_ratio": body_ratio,
-        "vol_ratio": p_vol / avg_vol
+        "vol_ratio": p_vol / avg_vol,
+        "pattern_type": pattern_type,
+        "pattern_desc": pattern_desc
     }
 
 def main():
@@ -154,10 +166,15 @@ def main():
 
     cache = {sym: t for sym, t in cache.items() if (current_time - t) / 3600 < COOLDOWN_HOURS}
 
-    timeframes_to_check = [
-        ("Daily (1D)", 1),
-        ("3-Day (3D)", 3),
-        ("Weekly (1W)", 7)
+    # Timeframes configuration: tuple of (Label, base_timeframe, aggregation_factor)
+    # 8h and 12h are built from 4h candles (2x 4h = 8h, 3x 4h = 12h)
+    # 1d, 3d, and weekly are built from 1d candles (1x = 1d, 3x = 3d, 7x = weekly)
+    scan_targets = [
+        ("8h", "4h", 2),
+        ("12h", "4h", 3),
+        ("Daily (1D)", "1d", 1),
+        ("3-Day (3D)", "1d", 3),
+        ("Weekly (1W)", "1d", 7)
     ]
 
     for symbol in symbols:
@@ -166,15 +183,19 @@ def main():
                 continue
 
         try:
+            # Fetch 4h and 1d source candles efficiently
+            h4_ohlcv = exchange.fetch_ohlcv(symbol, '4h', limit=100)
             daily_ohlcv = exchange.fetch_ohlcv(symbol, '1d', limit=100)
-            if len(daily_ohlcv) < 50:
+
+            if len(h4_ohlcv) < 50 or len(daily_ohlcv) < 50:
                 continue
 
-            for tf_label, days_per_candle in timeframes_to_check:
-                if days_per_candle == 1:
-                    tf_ohlcv = daily_ohlcv
+            found_alert = False
+            for tf_label, base_tf, factor in scan_targets:
+                if base_tf == '4h':
+                    tf_ohlcv = aggregate_candles(h4_ohlcv, factor)
                 else:
-                    tf_ohlcv = aggregate_candles(daily_ohlcv, days_per_candle)
+                    tf_ohlcv = aggregate_candles(daily_ohlcv, factor)
 
                 setup = analyze_tf_candles(symbol, tf_label, tf_ohlcv)
                 if setup:
@@ -182,13 +203,13 @@ def main():
                         f"🚀 *MEXC Perpetual Long Setup*\n\n"
                         f"🔹 *Pair:* `{symbol}`\n"
                         f"⏱ *Timeframe:* `{setup['timeframe']}` (Previous Closed Candle)\n"
-                        f"📊 *Pattern:* Falling Wedge Breakout\n\n"
+                        f"📊 *Pattern:* {setup['pattern_type']}\n\n"
                         f"🎯 *Entry Price:* `{setup['entry']:.4f}`\n"
                         f"🛑 *Stop Loss (SL):* `{setup['sl']:.4f}`\n"
                         f"✅ *Take Profit (TP):* `{setup['tp']:.4f}`\n"
                         f"⚖️ *Risk / Reward:* `1:{setup['rr']:.2f}`\n\n"
                         f"💡 *Why Long It:*\n"
-                        f"• **Falling Wedge Breakout:** Price decisively broke above upper wedge resistance, ending the descending consolidation channel.\n"
+                        f"• **{setup['pattern_type']}:** {setup['pattern_desc']}\n"
                         f"• **Solid Candle Confirmation:** Closed with a powerful bullish body ({setup['body_ratio']*100:.1f}% of total range), confirming strong buyer commitment.\n"
                         f"• **Volume Expansion:** Breakout volume surged to {setup['vol_ratio']:.1f}x the 20-period average, validating heavy institutional accumulation."
                     )
@@ -197,7 +218,11 @@ def main():
                     cache[symbol] = current_time
                     save_cache(cache)
                     time.sleep(0.5)
+                    found_alert = True
                     break
+            
+            if found_alert:
+                continue
 
         except Exception as e:
             print(f"Error processing {symbol}: {e}")
