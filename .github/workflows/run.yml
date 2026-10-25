@@ -1,37 +1,27 @@
-name: MEXC 1m RealTime
+name: MEXC EMA20 Long Bot PKT
 
 on:
   schedule:
-    - cron: '*/1 * * * *'
+    # PKT 1AM,5AM,9AM,1PM,5PM,9PM = UTC 20:00,0:00,4:00,8:00,12:00,16:00
+    - cron: '5 0,4,8,12,16,20 * * *'
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          
       - name: Install deps
-        run: |
-          pip install ccxt pandas requests matplotlib
-      - name: Run scanner with bash
+        run: pip install ccxt pandas requests matplotlib pytz
+
+      - name: Run Bot
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: |
-          bash -c '
-          echo "Starting 1m scanner..."
-          python bot.py
-          echo "Done"
-          '
-      - name: Save 24h state
-        run: |
-          git config --global user.name "bot"
-          git config --global user.email "bot@github.com"
-          git add alerted.json || true
-          git commit -m "alert [skip ci]" || true
-          git push || true
+        run: python bot.py
