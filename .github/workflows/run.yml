@@ -1,50 +1,37 @@
-name: MEXC Multi-Timeframe Wedge Scanner
+name: MEXC 1m RealTime
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # Runs automatically every 4 hours
-  workflow_dispatch: # Allows manual triggering from the Actions tab
+    - cron: '*/1 * * * *'
+  workflow_dispatch:
 
 jobs:
-  run-scanner:
+  scan:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # Required to push cache updates back to the repo
-
+      contents: write
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: Install Dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install ccxt requests matplotlib
-
-      - name: Run Scanner Script
+          pip install ccxt pandas requests matplotlib
+      - name: Run scanner with bash
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
+          bash -c '
+          echo "Starting 1m scanner..."
           python bot.py
-
-      - name: Commit & Push Cooldown Cache
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "Done"
+          '
+      - name: Save 24h state
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.io'
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git status
-          if [ -f "alerted_pairs.json" ]; then
-            git add alerted_pairs.json
-            git commit -m "chore: update 24h alert cooldown tracking [skip ci]" || echo "No changes to commit"
-            git push || echo "Push skipped"
-          else
-            echo "Cache file not found, skipping commit."
-          fi
-        continue-on-error: true
+          git config --global user.name "bot"
+          git config --global user.email "bot@github.com"
+          git add alerted.json || true
+          git commit -m "alert [skip ci]" || true
+          git push || true
