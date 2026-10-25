@@ -44,10 +44,8 @@ def save_cache(cache):
         print(f"Failed to save cache: {e}")
 
 def aggregate_candles(daily_ohlcv, period_days):
-    """Aggregates 1d OHLCV candles into multi-day (3d, weekly) candles."""
     if not daily_ohlcv:
         return []
-    
     aggregated = []
     for i in range(0, len(daily_ohlcv), period_days):
         chunk = daily_ohlcv[i:i + period_days]
@@ -63,15 +61,14 @@ def aggregate_candles(daily_ohlcv, period_days):
     return aggregated
 
 def analyze_tf_candles(symbol, tf_name, ohlcv):
-    # Need enough closed candles for pattern recognition + previous closed candle [-2]
     if len(ohlcv) < 30:
         return None
 
-    # Evaluate the PREVIOUS CLOSED CANDLE (index -2; index -1 is currently live/forming)
+    # Previous closed candle (index -2)
     prev_candle = ohlcv[-2]
     p_open, p_high, p_low, p_close, p_vol = prev_candle[1], prev_candle[2], prev_candle[3], prev_candle[4], prev_candle[5]
 
-    # 1. Solid Candle Filter (Bullish body >= 60% of total candle range)
+    # Solid Candle Filter (Bullish body >= 60% of total range)
     body_size = p_close - p_open
     total_range = p_high - p_low
     if total_range == 0:
@@ -82,7 +79,7 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     if not is_bullish or body_ratio < 0.6:
         return None
 
-    # 2. Volume Spike Filter (> 1.5x average of previous 20 closed candles)
+    # Volume Spike Filter (> 1.5x average of past 20 closed candles)
     history_vols = [c[5] for c in ohlcv[-22:-2]]
     if len(history_vols) < 20:
         return None
@@ -90,7 +87,7 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     if avg_vol == 0 or p_vol < avg_vol * 1.5:
         return None
 
-    # 3. Falling Wedge Structure Detection on preceding closed candles
+    # Falling Wedge Structure Detection
     pattern_candles = ohlcv[-27:-2]
     if len(pattern_candles) < 20:
         return None
@@ -104,7 +101,6 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     fh_low_avg = sum(lows[:half]) / half
     sh_low_avg = sum(lows[half:]) / (len(lows) - half)
 
-    # Highs and lows sloping downward with wedge convergence (contracting range)
     is_falling_highs = sh_high_avg < fh_high_avg
     is_falling_lows = sh_low_avg < fh_low_avg
     is_contracting = (highs[-1] - lows[-1]) < (highs[0] - lows[0])
@@ -112,18 +108,17 @@ def analyze_tf_candles(symbol, tf_name, ohlcv):
     if not (is_falling_highs and is_falling_lows and is_contracting):
         return None
 
-    # Breakout confirmation: previous closed candle close breaks above local resistance
     local_resistance = max(highs[-10:])
     if p_close <= local_resistance:
         return None
 
-    # 4. Risk / Reward Calculation (Min 1:2)
-    sl = min(lows[-10:])  # Stop loss placed below wedge lows
+    # Risk / Reward Calculation (Min 1:2)
+    sl = min(lows[-10:])
     risk = p_close - sl
     if risk <= 0:
         return None
 
-    tp = p_close + (risk * 2.5)  # Targeting 1:2.5 ratio (satisfying minimum 1:2)
+    tp = p_close + (risk * 2.5)
     rr_ratio = (tp - p_close) / risk
     if rr_ratio < 2.0:
         return None
@@ -157,20 +152,20 @@ def main():
     cache = load_cache()
     current_time = time.time()
 
-    # Prune cache entries older than 24h
     cache = {sym: t for sym, t in cache.items() if (current_time - t) / 3600 < COOLDOWN_HOURS}
 
-        timeframes_to_check = [("Daily (1D)", 1), ("3-Day (3D)", 3), ("Weekly (1W)", 7)]
-
+    timeframes_to_check = [
+        ("Daily (1D)", 1),
+        ("3-Day (3D)", 3),
+        ("Weekly (1W)", 7)
+    ]
 
     for symbol in symbols:
-        # Check 24h global cooldown per pair
         if symbol in cache:
             if (current_time - cache[symbol]) / 3600 < COOLDOWN_HOURS:
                 continue
 
         try:
-            # Fetch daily candles to build 1D, 3D, and Weekly timeframes efficiently
             daily_ohlcv = exchange.fetch_ohlcv(symbol, '1d', limit=100)
             if len(daily_ohlcv) < 50:
                 continue
