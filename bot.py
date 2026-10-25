@@ -34,8 +34,14 @@ def send_telegram_photo_alert(message, chart_path):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram credentials missing.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     
+    # If no chart exists, fallback to sending a text message with a "no chart" note
+    if not chart_path or not os.path.exists(chart_path):
+        text_with_notice = message + "\n\n📊 *Chart Status:* There is no chart available for this alert."
+        send_telegram_alert(text_with_notice)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
         with open(chart_path, 'rb') as photo:
             payload = {
@@ -49,6 +55,8 @@ def send_telegram_photo_alert(message, chart_path):
             print("Telegram photo alert sent successfully.")
     except Exception as e:
         print(f"Failed to send Telegram photo alert: {e}")
+        # Fallback to text message if photo upload fails
+        send_telegram_alert(message + "\n\n📊 *Chart Status:* There is no chart available for this alert.")
 
 def load_cache():
     if os.path.exists(CACHE_FILE):
@@ -281,9 +289,14 @@ def main():
             print(f"Error processing {symbol}: {e}")
             continue
 
-    # Send status update if no setups were found in this 4h cycle
+    # Send status update with explicit "no chart" notice if no setups were found in this 4h cycle
     if total_alerts_sent == 0:
-        status_msg = "🔍 *MEXC Scan Cycle Completed*\n\nNo pairs matched the Falling Wedge / CHoCH criteria in this 4h window.\n\n✅ *Scanner Status:* Active and working correctly!"
+        status_msg = (
+            "🔍 *MEXC Scan Cycle Completed*\n\n"
+            "No pairs matched the Falling Wedge / CHoCH criteria in this 4h window.\n\n"
+            "📊 *Chart Status:* There is no chart for this scan because no matching pair was found.\n\n"
+            "✅ *Scanner Status:* Active and working correctly!"
+        )
         send_telegram_alert(status_msg)
 
 if __name__ == "__main__":
