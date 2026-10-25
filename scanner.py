@@ -178,3 +178,14 @@ def analyze_market():
 
 if __name__ == "__main__":
     analyze_market()
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    # Automatically create the cache file if it doesn't exist yet
+    save_cache({})
+    return {}
