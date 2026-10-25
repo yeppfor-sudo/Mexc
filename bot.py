@@ -160,7 +160,8 @@ def main():
     # Prune cache entries older than 24h
     cache = {sym: t for sym, t in cache.items() if (current_time - t) / 3600 < COOLDOWN_HOURS}
 
-    timeframes_to_check = [("Daily (1D)", 1), ("3-Day (3D)", 3], ("Weekly (1W)", 7)]
+        timeframes_to_check = [("Daily (1D)", 1), ("3-Day (3D)", 3), ("Weekly (1W)", 7)]
+
 
     for symbol in symbols:
         # Check 24h global cooldown per pair
