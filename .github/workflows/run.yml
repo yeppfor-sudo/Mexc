@@ -1,29 +1,47 @@
-name: 4H Crypto Alert Bot
+name: MEXC Wedge Scanner
 
 on:
   schedule:
-    - cron: '30 */4 * * *' # Runs every 4 hours
-  workflow_dispatch: # Allows manual trigger from GitHub tab
+    - cron: '0 * * * *' # Runs automatically every hour. Change as needed.
+  workflow_dispatch: # Allows manual triggering from the Actions tab
 
 jobs:
-  run-bot:
+  run-scanner:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to commit cooldown updates back to repo
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
-          pip install ccxt pandas requests
+          python -m pip install --upgrade pip
+          pip install ccxt requests
 
       - name: Run Scanner Script
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python bot.py
+          python scanner.py
+
+      - name: Commit & Push Cooldown Cache
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.io'
+          git status
+          if git diff --quiet alerted_pairs.json; then
+            echo "No cache updates required."
+          else
+            git add alerted_pairs.json
+            git commit -m "chore: update 24h alert cooldown tracking [skip ci]"
+            git push
+          fi
+        continue-on-error: true
