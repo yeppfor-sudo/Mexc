@@ -1,7 +1,7 @@
-name: MEXC Futures Auto Long Short
+name: Auto Sniper
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 jobs:
   bot:
@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install ccxt pandas requests
+      - run: pip install ccxt pandas matplotlib requests
       - env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
