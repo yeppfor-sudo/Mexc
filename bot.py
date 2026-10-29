@@ -1,138 +1,205 @@
-import ccxt, pandas as pd, requests, os, io, time
-import matplotlib.pyplot as plt
-from datetime import datetime
+import ccxt, pandas as pd, requests, os, json, time
+from datetime import datetime, timedelta
 
 BOT_TOKEN=os.getenv("BOT_TOKEN"); CHAT_ID=os.getenv("CHAT_ID")
 API_KEY=os.getenv("MEXC_API_KEY"); API_SECRET=os.getenv("MEXC_API_SECRET")
 
+# CONFIG FOR $10
+LEVERAGE=20
+RISK_PCT=0.10
+TP_R=2.5
+DAILY_TARGET=0.05
+DAILY_STOP=0.15
+LEARN_FILE="trades_memory.json"
+
 def t(m):
-    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id":CHAT_ID,"text":m,"parse_mode":"HTML"}, timeout=15)
+    try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data={"chat_id":CHAT_ID,"text":m,"parse_mode":"HTML"}, timeout=20)
     except: pass
 
 def ema(s,n): return s.ewm(span=n, adjust=False).mean()
 def rsi(s,p=14):
-    d=s.diff()
-    g=d.where(d>0,0).ewm(alpha=1/p, adjust=False).mean()
+    d=s.diff(); g=d.where(d>0,0).ewm(alpha=1/p, adjust=False).mean()
     l=(-d.where(d<0,0)).ewm(alpha=1/p, adjust=False).mean()
     return 100-(100/(1+g/l))
 
-def adx(df,p=14):
-    h,l,c=df['h'],df['l'],df['c']
-    tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-    atr=tr.rolling(p).mean()
-    plus_dm=h.diff().where((h.diff()>l.diff().mul(-1))&(h.diff()>0),0).rolling(p).mean()
-    minus_dm=l.diff().mul(-1).where((l.diff().mul(-1)>h.diff())&(l.diff().mul(-1)>0),0).rolling(p).mean()
-    plus_di=100*plus_dm/atr; minus_di=100*minus_dm/atr
-    dx=100*(abs(plus_di-minus_di)/(plus_di+minus_di)).fillna(0)
-    return dx.rolling(p).mean()
-
-def snipe_auto(df, df5, df15):
-    if len(df)<60: return None
-    for d in [df,df5,df15]:
-        d['ema9']=ema(d['c'],9); d['ema20']=ema(d['c'],20); d['rsi']=rsi(d['c'],14)
-    df['vma']=df['v'].rolling(20).mean(); df['adx']=adx(df)
-    last=df.iloc[-1]; last5=df5.iloc[-1]; last15=df15.iloc[-1]
-    if last['v'] < last['vma']*3.2: return None
-    if not (22 <= last['rsi'] <= 42): return None
-    if last['adx'] < 18: return None
-    if not (last['c'] > last['o'] and last['c'] > last['ema9']): return None
-    if not (abs(last['c']-last['ema20'])/last['ema20'] < 0.006): return None
-    if last5['c'] < last5['o']: return None
-    if last15['rsi'] > 60: return None
-    tight=df.iloc[-7:-1]
-    if (tight['h'].max()-tight['l'].min())/tight['l'].min() > 0.045: return None
-    if not (df.iloc[-3]['c'] < df.iloc[-3]['o'] and df.iloc[-2]['c'] < df.iloc[-2]['o']): return None
-    sl=last['l']*0.994
-    risk=last['c']-sl
-    if risk<=0 or risk/last['c']>0.012: return None
-    score=(last['v']/last['vma'])*3 + (42-last['rsi'])*0.5
-    return {'curr':last['c'],'sl':sl,'tp1':last['c']+risk*2.2,'tp2':last['c']+risk*4,'score':score,'df':df}
-
-def auto_trade(sym, res, ex):
+# 1. MARKET ANALYSIS - 1D BTC CANDLE + TREND
+def market_brain(ex):
     try:
-        # Check balance
-        bal=ex.fetch_balance()
-        usdt=bal['USDT']['free'] if 'USDT' in bal else 0
-        if usdt < 5:
-            t(f"❌ Low balance ${usdt:.2f} - Need $10 min")
-            return False
-        # Position size 20% of balance, leverage 10x
-        amount_usdt = usdt * 0.20
-        amount_coin = amount_usdt * 10 / res['curr']  # 10x lev
-        # Set leverage
-        ex.set_leverage(10, sym)
-        # BUY MARKET
-        order=ex.create_market_buy_order(sym, amount_coin)
-        entry=res['curr']
-        t(f"🚀 AUTO BUY {sym}\nEntry {entry:.6f}\nSize ${amount_usdt:.2f} x10 = {amount_coin:.2f} coins\nSL {res['sl']:.6f} TP1 {res['tp1']:.6f} TP2 {res['tp2']:.6f}")
-        # Set SL and TP
-        time.sleep(1)
-        ex.create_order(sym,'stop','sell',amount_coin,res['sl'],{'stopPrice':res['sl']})
-        ex.create_order(sym,'limit','sell',amount_coin*0.5,res['tp1'])
-        ex.create_order(sym,'limit','sell',amount_coin*0.5,res['tp2'])
-        t(f"✅ Orders placed: SL + TP1(50%) + TP2(50%)")
+        btc=pd.DataFrame(ex.fetch_ohlcv('BTC/USDT:USDT','1d',limit=50), columns=['t','o','h','l','c','v'])
+        btc['ema20']=ema(btc['c'],20); btc['ema50']=ema(btc['c'],50); btc['rsi']=rsi(btc['c'])
+        last=btc.iloc[-1]; prev=btc.iloc[-2]
+        trend="BULL" if last['c']>last['ema20']>last['ema50'] else "BEAR" if last['c']<last['ema20']<last['ema50'] else "RANGE"
+        btc_change=(last['c']-prev['c'])/prev['c']*100
+        bias="LONG" if trend=="BULL" and last['rsi']<70 else "SHORT" if trend=="BEAR" and last['rsi']>30 else "BOTH"
+        return {"trend":trend,"bias":bias,"btc_rsi":last['rsi'],"btc_change":btc_change,"btc_price":last['c']}
+    except: return {"trend":"RANGE","bias":"BOTH","btc_rsi":50,"btc_change":0,"btc_price":0}
+
+# SENTIMENT
+def sentiment_check():
+    try:
+        fg=requests.get("https://api.alternative.me/fng/?limit=1",timeout=5).json()
+        fear=fg['data'][0]['value']; fear_text=fg['data'][0]['value_classification']
+    except: fear=50; fear_text="Neutral"
+    return {"fear":int(fear),"fear_text":fear_text}
+
+# 11. AI LEARN FROM PAST LOSSES
+def load_memory():
+    if os.path.exists(LEARN_FILE):
+        try: return json.loads(open(LEARN_FILE).read())
+        except: pass
+    return {"trades":[],"win":0,"loss":0,"best_rsi_long":[20,42],"best_rsi_short":[58,80],"avoid_symbols":[],"win_vol":2.0}
+
+def save_memory(mem):
+    try: open(LEARN_FILE,'w').write(json.dumps(mem))
+    except: pass
+
+def ai_adjust(mem):
+    # Learn from losses
+    if mem['loss']>=3:
+        recent_losses=[x for x in mem['trades'][-10:] if x['result']=='loss']
+        if len(recent_losses)>=3:
+            # If losses on low vol, increase vol filter
+            avg_vol=sum([x['vol'] for x in recent_losses])/len(recent_losses)
+            if avg_vol<2.5:
+                mem['win_vol']=min(3.0, mem['win_vol']+0.2)
+            # If losses on longs, tighten RSI
+            long_losses=[x for x in recent_losses if x['side']=='long']
+            if len(long_losses)>=2:
+                mem['best_rsi_long'][1]=max(35, mem['best_rsi_long'][1]-2)
+    return mem
+
+# 9. BEST SETUPS SCAN WITH LEARNING
+def scan(df, mem, market):
+    if len(df)<50: return None
+    df['ema9']=ema(df['c'],9); df['rsi']=rsi(df['c'],14); df['vma']=df['v'].rolling(20).mean()
+    last=df.iloc[-1]
+    if last['v'] < last['vma']*mem['win_vol']: return None
+    
+    rsi_low, rsi_high=mem['best_rsi_long']
+    # Filter by market bias
+    if market['bias']=="SHORT": rsi_high=38 # Only very oversold longs in bear
+    if market['bias']=="LONG": rsi_low=25
+    
+    # LONG SETUP - Best
+    if rsi_low<last['rsi']<rsi_high and last['c']>last['o'] and last['c']>last['ema9']:
+        sl=last['l']*0.995
+        risk=(last['c']-sl)/last['c']
+        if risk>0.012 or risk<0.001: return None
+        score=(rsi_high-last['rsi'])*last['v']/last['vma']  # Best score
+        return {'side':'long','p':last['c'],'sl':sl,'tp':last['c']+(last['c']-sl)*TP_R,'rsi':last['rsi'],'vol':last['v']/last['vma'],'risk':risk,'score':score}
+    
+    rsi_s_low, rsi_s_high=mem['best_rsi_short']
+    if market['bias']=="LONG": rsi_s_low=62
+    if rsi_s_low<last['rsi']<rsi_s_high and last['c']<last['o'] and last['c']<last['ema9']:
+        sl=last['h']*1.005
+        risk=(sl-last['c'])/last['c']
+        if risk>0.012 or risk<0.001: return None
+        score=(last['rsi']-rsi_s_low)*last['v']/last['vma']
+        return {'side':'short','p':last['c'],'sl':sl,'tp':last['c']-(sl-last['c'])*TP_R,'rsi':last['rsi'],'vol':last['v']/last['vma'],'risk':risk,'score':score}
+    return None
+
+def execute(sym,sig,ex,total,mem):
+    try:
+        ex.set_leverage(LEVERAGE,sym); ex.set_margin_mode('isolated',sym)
+        risk_usdt=total*RISK_PCT
+        qty=(risk_usdt/sig['risk']*LEVERAGE)/sig['p']
+        qty=ex.amount_to_precision(sym, qty)
+        if float(qty)*sig['p']<5: qty=ex.amount_to_precision(sym, 5.5/sig['p'])
+        if sig['side']=='long':
+            ex.create_market_buy_order(sym,qty)
+            ex.create_order(sym,'market','sell',qty,None,{'stopPrice':sig['sl'],'type':'stop_market'})
+            ex.create_limit_sell_order(sym,qty,sig['tp'])
+        else:
+            ex.create_market_sell_order(sym,qty)
+            ex.create_order(sym,'market','buy',qty,None,{'stopPrice':sig['sl'],'type':'stop_market'})
+            ex.create_limit_buy_order(sym,qty,sig['tp'])
+        win=risk_usdt*TP_R
+        t(f"{'🚀 LONG' if sig['side']=='long' else '🔻 SHORT'} {sym}\n🔄 COMPOUND EVERY TRADE\nBal NOW ${total:.2f}\nRisk ${risk_usdt:.2f} → Win +${win:.2f}\nAfter WIN ${total+win:.2f} NEXT risk ${(total+win)*RISK_PCT:.2f}\nEntry {sig['p']:.6f} SL {sig['sl']:.6f} TP {sig['tp']:.6f}\nScore {sig['score']:.1f} Vol {sig['vol']:.1f}x RSI {sig['rsi']:.0f}\nLev {LEVERAGE}x Iso\nAI Vol filter {mem['win_vol']:.1f}x")
+        mem['trades'].append({"time":str(datetime.utcnow()),"symbol":sym,"side":sig['side'],"result":"open","vol":sig['vol'],"rsi":sig['rsi']})
+        save_memory(mem)
         return True
     except Exception as e:
-        t(f"❌ Auto trade failed {sym}: {str(e)[:100]}")
+        t(f"❌ {sym}: {str(e)[:200]}")
         return False
 
 # MAIN
-t(f"🤖 AUTO SNIPER START {datetime.utcnow().strftime('%H:%M UTC')}")
+t(f"🧠 AI SELF-LEARNING SNIPER V9 {datetime.utcnow().strftime('%H:%M UTC')} $10 MODE")
+
+ex=ccxt.mexc({'apiKey':API_KEY,'secret':API_SECRET,'enableRateLimit':True}) if API_KEY else ccxt.mexc({'enableRateLimit':True})
+ex.options['defaultType']='swap'; ex.options['defaultMarginMode']='isolated'
+ex.load_markets()
+
+mem=load_memory()
+mem=ai_adjust(mem)
+
+market=market_brain(ex)
+sent=sentiment_check()
+
+t(f"📊 MARKET BRAIN 1D BTC CLOSED:\nBTC ${market['btc_price']:.0f} {market['btc_change']:+.2f}%\nTrend {market['trend']} Bias {market['bias']} RSI {market['btc_rsi']:.0f}\nFear&Greed {sent['fear']} {sent['fear_text']}\nToday BEST: {market['bias']} trades\nAI Learning: W{mem['win']} L{mem['loss']} Vol filter {mem['win_vol']:.1f}x\nRSI Long {mem['best_rsi_long']} Short {mem['best_rsi_short']}")
 
 if not API_KEY:
-    t("⚠️ No API Key - Running in ALERT ONLY mode. Add MEXC_API_KEY secret for auto trade")
-    ex_public=ccxt.mexc({'enableRateLimit':True}); ex_public.options['defaultType']='swap'; ex_public.load_markets()
-    BLACK={'BTC','ETH','SOL','BNB','XRP','EWJ','KWEB','STOCK','SPX'}
-    FOUND=[]
-    syms=[m['symbol'] for m in ex_public.markets.values() if ':USDT' in m['symbol']][:200]
-    for sym in syms:
-        clean=sym.split('/')[0]
-        if any(b in clean for b in BLACK): continue
-        try:
-            ohlcv=ex_public.fetch_ohlcv(sym,'1m',limit=80)
-            ohlcv5=ex_public.fetch_ohlcv(sym,'5m',limit=50)
-            ohlcv15=ex_public.fetch_ohlcv(sym,'15m',limit=50)
-            df=pd.DataFrame(ohlcv,columns=['t','o','h','l','c','v'])
-            df5=pd.DataFrame(ohlcv5,columns=['t','o','h','l','c','v'])
-            df15=pd.DataFrame(ohlcv15,columns=['t','o','h','l','c','v'])
-            res=snipe_auto(df,df5,df15)
-            if res: FOUND.append((res['score'],sym,res))
-        except: continue
-    TOP=sorted(FOUND, key=lambda x:x[0], reverse=True)[:1]
-    if TOP:
-        t(f"🎯 Would BUY {TOP[0][1]} but no API key - Add keys for auto")
-else:
-    ex=ccxt.mexc({'apiKey':API_KEY,'secret':API_SECRET,'enableRateLimit':True})
-    ex.options['defaultType']='swap'; ex.load_markets()
-    BLACK={'BTC','ETH','SOL','BNB','XRP','EWJ','KWEB','STOCK','SPX'}
-    FOUND=[]
-    # Check existing positions - don't open if already in trade
-    try:
-        positions=ex.fetch_positions()
-        open_syms=[p['symbol'] for p in positions if float(p['contracts'])>0]
-        if open_syms:
-            t(f"⏸️ Already in position {open_syms} - Skipping")
-            exit()
-    except: pass
-    syms=[m['symbol'] for m in ex.markets.values() if ':USDT' in m['symbol']][:200]
-    for sym in syms:
-        clean=sym.split('/')[0]
-        if any(b in clean for b in BLACK): continue
-        try:
-            ohlcv=ex.fetch_ohlcv(sym,'1m',limit=80)
-            ohlcv5=ex.fetch_ohlcv(sym,'5m',limit=50)
-            ohlcv15=ex.fetch_ohlcv(sym,'15m',limit=50)
-            df=pd.DataFrame(ohlcv,columns=['t','o','h','l','c','v'])
-            df5=pd.DataFrame(ohlcv5,columns=['t','o','h','l','c','v'])
-            df15=pd.DataFrame(ohlcv15,columns=['t','o','h','l','c','v'])
-            res=snipe_auto(df,df5,df15)
-            if res: FOUND.append((res['score'],sym,res))
-        except: continue
-    TOP=sorted(FOUND, key=lambda x:x[0], reverse=True)[:1]
-    if TOP:
-        auto_trade(TOP[0][1], TOP[0][2], ex)
-    else:
-        t("No high accuracy signal this scan - Next scan in 15m")
+    t("⚠️ Add MEXC API keys")
+    exit()
 
-t("🤖 Auto Sniper cycle done")
+bal=ex.fetch_balance()
+total=float(bal['USDT']['total']) if bal['USDT'] else 0
+free=float(bal['USDT']['free']) if bal['USDT'] else 0
+
+# DAILY LOSS TRACKER
+today=datetime.utcnow().date()
+daily_file=f"daily_{today}.json"
+daily={"pnl":0,"trades":0}
+if os.path.exists(daily_file):
+    try: daily=json.loads(open(daily_file).read())
+    except: pass
+
+if daily['pnl'] <= -total*DAILY_STOP:
+    t(f"🛑 DAILY MAX LOSS 15% HIT! PnL ${daily['pnl']:.2f}\nProtecting ${total:.2f} - STOPPED TODAY")
+    exit()
+
+if daily['pnl'] >= total*DAILY_TARGET:
+    t(f"✅ DAILY 5% TARGET HIT! PnL +${daily['pnl']:.2f}\nNew Bal ${total:.2f}\n🔄 Compound tomorrow: Risk ${(total)*RISK_PCT:.2f}")
+    # WEEKLY/MONTHLY REPORT
+    if datetime.utcnow().hour==0:
+        t(f"📈 WEEKLY REPORT\nBalance ${total:.2f}\nW{mem['win']} L{mem['loss']} WR {mem['win']/(mem['win']+mem['loss']+0.001)*100:.0f}%\nAI Adjusted RSI {mem['best_rsi_long']}")
+    exit()
+
+t(f"💰 Total ${total:.2f} Free ${free:.2f}\nDaily PnL ${daily['pnl']:.2f} / Target +${total*DAILY_TARGET:.2f} Stop -${total*DAILY_STOP:.2f}\nRisk EVERY TRADE ${total*RISK_PCT:.2f} (10%) → Win +${total*RISK_PCT*TP_R:.2f}\nTrades today {daily['trades']}\nAI Trades {len(mem['trades'])}")
+
+pos=ex.fetch_positions()
+open_pos=[p for p in pos if float(p['contracts'])>0]
+if open_pos:
+    pnl=sum([float(p['unrealizedPnl']) for p in open_pos])
+    t(f"⏸️ {len(open_pos)} open (Isolated multi) PnL ${pnl:.2f}\n{[p['symbol'] for p in open_pos][:3]}\nCan open more - Isolated system")
+    # Don't exit - allow multi trades, but max 3
+    if len(open_pos)>=3:
+        t("⏸️ Max 3 isolated trades open - Waiting")
+        exit()
+
+# SCAN BEST 3 SETUPS
+syms=[s for s in ex.markets if ':USDT' in s][:500]
+found=[]
+for sym in syms:
+    if sym in mem['avoid_symbols'][-5:]: continue
+    try:
+        df=pd.DataFrame(ex.fetch_ohlcv(sym,'1m',limit=60),columns=['t','o','h','l','c','v'])
+        s=scan(df,mem,market)
+        if s: found.append((s['score'],sym,s))
+    except: continue
+
+found=sorted(found,key=lambda x:x[0],reverse=True)[:2]  # Take best 2
+
+if found:
+    for score,sym,sig in found:
+        if len(ex.fetch_positions())>=3: break
+        execute(sym,sig,ex,total,mem)
+        time.sleep(1)
+        # Update total for next trade compound
+        bal=ex.fetch_balance()
+        total=float(bal['USDT']['total']) if bal['USDT'] else total
+else:
+    t(f"No best setup now - Market {market['trend']} {market['bias']}\nAI waiting for perfect sniper - Next scan 5m")
+
+# SAVE DAILY
+open(daily_file,'w').write(json.dumps(daily))
+t("✅ AI Cycle done - Learning, Compounding, 24/7")
