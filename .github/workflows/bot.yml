@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install
-        run: pip install -r requirements.txt --upgrade
+        run: pip install -r requirements.txt
       - name: Run HFT Bot
         env:
           MEXC_API_KEY: ${{ secrets.MEXC_API_KEY }}
