@@ -1,13 +1,10 @@
 import os, asyncio, json, ccxt, pandas as pd, numpy as np, requests, pytz, pickle, time, sys
 from datetime import datetime, timedelta
-import websockets
 from sklearn.ensemble import RandomForestClassifier
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("CHAT_ID")
 PKT = pytz.timezone('Asia/Karachi')
-
-print(f"TOKEN exists: {bool(TOKEN)} CHAT exists: {bool(CHAT)}", flush=True)
 
 START_CAP = 8.54
 LEVERAGE = 5
@@ -22,7 +19,9 @@ BLOCK = {'BTC','ETH','SOL','BNB','XRP','USDC','FDUSD','STOCK','ETF','GOLD'}
 def tg(m):
     try:
         requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id":CHAT,"text":m,"parse_mode":"Markdown"}, timeout=15)
-    except: pass
+        print(f"TG: {m}", flush=True)
+    except Exception as e:
+        print(f"TG Error {e}")
 
 def load(f,d):
     try:
@@ -31,14 +30,14 @@ def load(f,d):
 def save(f,d):
     with open(f,'w') as x: json.dump(d,x,indent=2)
 
-tg(f"✅ *Bot Started* Bal ${START_CAP} | Compound Every Trade")
+tg(f"✅ *Bot Started* Bal ${START_CAP} | REST Mode | Compound Every Trade")
 time.sleep(1)
 
 try:
     ex = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET"), 'enableRateLimit': True, 'options':{'defaultType':'swap'}})
     ex.load_markets()
     bal = ex.fetch_balance()['USDT']
-    tg(f"✅ MEXC OK Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f}")
+    tg(f"✅ MEXC OK | Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f}")
 except Exception as e:
     tg(f"❌ MEXC Error: {e}")
     sys.exit(1)
@@ -73,57 +72,21 @@ class Brain:
 
 brain = Brain()
 
-# FIXED WS - NO SPAM
-async def mexc_ws_hybrid(symbols, runtime_minutes=340):
-    uri = "wss://contract.mexc.com/edge"
-    subs=[]
-    for sym in symbols:
-        mexc_sym = sym.replace('/','').replace(':USDT','').replace('USDT','') + "_USDT"
-        subs.append({"method":"sub.depth", "param":{"symbol":mexc_sym}})
-        subs.append({"method":"sub.fundingRate", "param":{"symbol":mexc_sym}})
+# REST ONLY - NO WS 1005 ERROR
+async def data_updater(symbols, runtime_minutes=340):
     start = time.time()
-    first_connect = True
+    tg(f"📡 *REST Data Live* {len(symbols)} syms | OB+Funding polling every 5s")
     while time.time() - start < runtime_minutes*60:
-        try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
-                for s in subs:
-                    await ws.send(json.dumps(s))
-                    await asyncio.sleep(0.05)
-                # TG ONLY FIRST TIME - NO SPAM
-                if first_connect:
-                    tg(f"📡 *WS Connected* {len(symbols)} syms | {runtime_minutes}m | Compound Every Trade | Live")
-                    first_connect = False
-                else:
-                    print("WS Reconnected (no TG spam)", flush=True)
-                while time.time() - start < runtime_minutes*60:
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=15)
-                        data = json.loads(msg)
-                        if 'data' in data:
-                            d=data['data']
-                            if 'bids' in d:
-                                bids=d.get('bids',[]); asks=d.get('asks',[])
-                                imb, spread, bvol, avol = brain.calc_ob(bids, asks)
-                                for s in symbols:
-                                    if s.split('/')[0] in data.get('symbol',''):
-                                        brain.orderbooks[s]={"imb":imb,"spread":spread,"bvol":bvol,"avol":avol}
-                            if 'fundingRate' in d or 'rate' in d:
-                                rate=float(d.get('fundingRate', d.get('rate',0)))
-                                for s in symbols:
-                                    if s.split('/')[0] in data.get('symbol',''):
-                                        brain.funding[s]=rate
-                    except asyncio.TimeoutError:
-                        # Fallback REST - no spam
-                        for sym in symbols[:8]:
-                            try:
-                                ob=ex.fetch_order_book(sym, limit=20)
-                                imb, spread, bvol, avol = brain.calc_ob(ob['bids'], ob['asks'])
-                                brain.orderbooks[sym]={"imb":imb,"spread":spread,"bvol":bvol,"avol":avol}
-                            except: pass
-                        continue
-        except Exception as e:
-            print(f"WS Error {e}, reconnect in 10s (no TG)", flush=True)
-            await asyncio.sleep(10)
+        for sym in symbols:
+            try:
+                ob=ex.fetch_order_book(sym, limit=20)
+                imb, spread, bvol, avol = brain.calc_ob(ob['bids'], ob['asks'])
+                brain.orderbooks[sym]={"imb":imb,"spread":spread,"bvol":bvol,"avol":avol}
+                fr=ex.fetch_funding_rate(sym)
+                brain.funding[sym]=float(fr.get('fundingRate',0))
+            except: pass
+            await asyncio.sleep(0.3)
+        await asyncio.sleep(3)
 
 def get_cap():
     d=load(CAP_FILE, {"cap":START_CAP, "day_start":START_CAP, "date":str(datetime.now(PKT).date())})
@@ -140,6 +103,7 @@ def pos_size():
     free = float(bal_data.get('free', total))
     size = total * COMPOUND_EVERY_TRADE
     size = max(1.0, min(free*0.90, size, 3.0))
+    print(f"COMPOUND: Total ${total:.2f} Free ${free:.2f} -> Size ${size:.2f}", flush=True)
     return size, total, free
 
 def daily_bias():
@@ -219,7 +183,7 @@ async def trading_loop(symbols, runtime_minutes=340):
                     await asyncio.sleep(2)
                 except Exception as e: 
                     print(f"Trade error {sym}: {e}", flush=True)
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)
             await asyncio.sleep(5)
         except Exception as e:
             print(f"Loop {e}"); await asyncio.sleep(5)
@@ -228,9 +192,9 @@ async def main():
     tickers=ex.fetch_tickers()
     syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK]
     syms=sorted(syms, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15]
-    tg(f"🚀 *HFT STARTED* ${START_CAP} | Compound Every Trade | {len(syms)} syms | LEV {LEVERAGE}X | Profit ∞ Loss -15%")
+    tg(f"🚀 *HFT STARTED REST* ${START_CAP} | Compound Every Trade | {len(syms)} syms | LEV {LEVERAGE}X | Profit ∞ Loss -15%")
     await asyncio.gather(
-        mexc_ws_hybrid(syms, 340),
+        data_updater(syms, 340),
         trading_loop(syms, 340)
     )
 
