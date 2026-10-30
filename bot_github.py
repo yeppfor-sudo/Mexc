@@ -1,4 +1,4 @@
-import os, asyncio, json, ccxt, pandas as pd, numpy as np, requests, pytz, pickle, time
+import os, asyncio, json, ccxt, pandas as pd, numpy as np, requests, pytz, pickle, time, sys
 from datetime import datetime, timedelta
 import websockets
 from sklearn.ensemble import RandomForestClassifier
@@ -6,6 +6,9 @@ from sklearn.ensemble import RandomForestClassifier
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("CHAT_ID")
 PKT = pytz.timezone('Asia/Karachi')
+
+print(f"TOKEN exists: {bool(TOKEN)} CHAT exists: {bool(CHAT)}", flush=True)
+print(f"MEXC KEY exists: {bool(os.getenv('MEXC_API_KEY'))}", flush=True)
 
 START_CAP = 8.0
 LEVERAGE = 7
@@ -18,8 +21,12 @@ MEM_FILE = "memory.json"
 BLOCK = {'BTC','ETH','SOL','BNB','XRP','USDC','FDUSD','STOCK','ETF','GOLD'}
 
 def tg(m):
-    try: requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id":CHAT,"text":m,"parse_mode":"Markdown"}, timeout=15)
-    except: pass
+    try:
+        print(f"Sending TG: {m}", flush=True)
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id":CHAT,"text":m,"parse_mode":"Markdown"}, timeout=15)
+        print(f"TG Response: {r.text}", flush=True)
+    except Exception as e:
+        print(f"TG Error: {e}", flush=True)
 
 def load(f,d):
     try:
@@ -28,8 +35,18 @@ def load(f,d):
 def save(f,d):
     with open(f,'w') as x: json.dump(d,x,indent=2)
 
-ex = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET"), 'enableRateLimit': True, 'options':{'defaultType':'swap'}})
-ex.load_markets()
+# --- DEBUG START ---
+tg(f"✅ *DEBUG Bot Started* GitHub Actions is working! Time: {datetime.now()}")
+time.sleep(2)
+
+try:
+    ex = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET"), 'enableRateLimit': True, 'options':{'defaultType':'swap'}})
+    ex.load_markets()
+    tg("✅ MEXC API Connected OK")
+except Exception as e:
+    tg(f"❌ MEXC Error: {e}")
+    print(f"MEXC Error {e}", flush=True)
+    sys.exit(1)
 
 class Brain:
     def __init__(self):
@@ -62,15 +79,13 @@ class Brain:
 
 brain = Brain()
 
-# ===== HYBRID WS + REST FOR GITHUB =====
-async def mexc_ws_hybrid(symbols, runtime_minutes=340): # 5h40m max for GitHub
+async def mexc_ws_hybrid(symbols, runtime_minutes=340):
     uri = "wss://contract.mexc.com/edge"
     subs=[]
     for sym in symbols:
         mexc_sym = sym.replace('/','').replace(':USDT','').replace('USDT','') + "_USDT"
         subs.append({"method":"sub.depth", "param":{"symbol":mexc_sym}})
         subs.append({"method":"sub.fundingRate", "param":{"symbol":mexc_sym}})
-    
     start = time.time()
     while time.time() - start < runtime_minutes*60:
         try:
@@ -97,7 +112,6 @@ async def mexc_ws_hybrid(symbols, runtime_minutes=340): # 5h40m max for GitHub
                                     if s.split('/')[0] in data.get('symbol',''):
                                         brain.funding[s]=rate
                     except asyncio.TimeoutError:
-                        # Fallback REST if WS stalls
                         for sym in symbols[:10]:
                             try:
                                 ob=ex.fetch_order_book(sym, limit=20)
@@ -136,21 +150,17 @@ async def trading_loop(symbols, runtime_minutes=340):
     bias=daily_bias()
     last_day=datetime.now(PKT).date()
     start=time.time()
-    
     while time.time() - start < runtime_minutes*60:
         try:
             cd=get_cap(); cap=cd['cap']; day_start=cd['day_start']
             dpct=(cap-day_start)/day_start*100 if day_start>0 else 0
-            
             if dpct <= -15:
                 tg(f"🛑 DAILY -15% ${cap:.2f} Paused till tomorrow")
                 while datetime.now(PKT).date()==last_day and time.time()-start < runtime_minutes*60:
                     await asyncio.sleep(60)
                 bias=daily_bias(); last_day=datetime.now(PKT).date(); continue
-            
             if dpct>=5:
                 tg(f"✅ +5% TARGET ${cap:.2f} (+{dpct:.1f}%) Continuing HFT")
-            
             cands=[]
             for sym in symbols[:30]:
                 try:
@@ -170,11 +180,9 @@ async def trading_loop(symbols, runtime_minutes=340):
                             cands.append((sym,tf,score,ob['imb'],fr))
                             break
                 except: continue
-            
             cands.sort(key=lambda x: x[2], reverse=True)
             positions=ex.fetch_positions()
             open_cnt=len([p for p in positions if float(p.get('contracts',0))>0])
-            
             for sym,tf,score,imb,fr in cands[:4]:
                 if open_cnt>=MAX_PARALLEL: break
                 if ex.fetch_balance()['USDT']['free']<1.2: break
@@ -198,7 +206,6 @@ async def trading_loop(symbols, runtime_minutes=340):
                     open_cnt+=1
                     await asyncio.sleep(1)
                 except Exception as e: print(e)
-            
             await asyncio.sleep(5)
         except Exception as e:
             print(f"Loop {e}"); await asyncio.sleep(5)
