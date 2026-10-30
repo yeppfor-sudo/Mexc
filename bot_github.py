@@ -30,7 +30,7 @@ def load(f,d):
 def save(f,d):
     with open(f,'w') as x: json.dump(d,x,indent=2)
 
-tg(f"✅ *Bot Started* Bal ${START_CAP} | REST Mode | Compound Every Trade")
+tg(f"✅ *Bot Started* Bal ${START_CAP} | REST Aggressive 0.58 | Compound Every Trade")
 time.sleep(1)
 
 try:
@@ -72,10 +72,9 @@ class Brain:
 
 brain = Brain()
 
-# REST ONLY - NO WS 1005 ERROR
 async def data_updater(symbols, runtime_minutes=340):
     start = time.time()
-    tg(f"📡 *REST Data Live* {len(symbols)} syms | OB+Funding polling every 5s")
+    tg(f"📡 *REST Data Live* {len(symbols)} syms | OB+Funding polling every 5s | Aggressive 0.58")
     while time.time() - start < runtime_minutes*60:
         for sym in symbols:
             try:
@@ -86,7 +85,7 @@ async def data_updater(symbols, runtime_minutes=340):
                 brain.funding[sym]=float(fr.get('fundingRate',0))
             except: pass
             await asyncio.sleep(0.3)
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
 def get_cap():
     d=load(CAP_FILE, {"cap":START_CAP, "day_start":START_CAP, "date":str(datetime.now(PKT).date())})
@@ -113,7 +112,7 @@ def daily_bias():
         df['ema50']=df['c'].ewm(50).mean()
         last=df.iloc[-2]
         bias="LONG" if last['c']>last['ema50'] else "SHORT" if last['c']<last['ema50']*0.98 else "BOTH"
-        tg(f"🌍 *BIAS* BTC ${last['c']:.0f} -> {bias}")
+        tg(f"🌍 *BIAS* BTC ${last['c']:.0f} -> {bias} | Aggressive ON")
         return bias
     except: return "BOTH"
 
@@ -132,32 +131,35 @@ async def trading_loop(symbols, runtime_minutes=340):
                 bias=daily_bias(); last_day=datetime.now(PKT).date(); continue
 
             cands=[]
-            for sym in symbols[:30]:
+            for sym in symbols:  # SCAN ALL 15
                 try:
                     fr=brain.funding.get(sym,0)
                     ob=brain.orderbooks.get(sym)
                     if not ob: continue
-                    if ob['spread']>0.15: continue
-                    if bias=="LONG" and ob['imb']<-0.35: continue
-                    if bias=="SHORT" and ob['imb']>0.35: continue
-                    for tf in ['1m','5m','15m']:
+                    if ob['spread']>0.25: continue  # LOOSER: 0.25% was 0.15%
+                    # Less strict imbalance
+                    if bias=="LONG" and ob['imb']<-0.50: continue
+                    if bias=="SHORT" and ob['imb']>0.50: continue
+                    for tf in ['1m','5m']:
                         ohlcv=ex.fetch_ohlcv(sym,tf,limit=100)
                         df=pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
                         if len(df)<60: continue
                         score=brain.score(df,sym)
-                        if score>0.72:
-                            if fr>0.0008 and score<0.85: continue
+                        if score>0.58:  # AGGRESSIVE: was 0.72 now 0.58
                             cands.append((sym,tf,score,ob['imb'],fr))
                             break
-                except: continue
+                except Exception as e:
+                    print(f"Scan {sym} {e}")
+                    continue
             cands.sort(key=lambda x: x[2], reverse=True)
+            print(f"Scan: {len(cands)} candidates found | Best: {cands[0] if cands else 'none'}", flush=True)
             positions=ex.fetch_positions()
             open_cnt=len([p for p in positions if float(p.get('contracts',0))>0])
             for sym,tf,score,imb,fr in cands[:2]:
                 if open_cnt>=MAX_PARALLEL: break
                 size_usdt, total_bal, free_bal = pos_size()
                 if free_bal < 0.8: break
-                side='buy' if imb>0.1 else 'sell'
+                side='buy' if imb>0.05 else 'sell'
                 if bias=="LONG": side='buy'
                 if bias=="SHORT": side='sell'
                 if fr>0.0008: side='sell'
@@ -170,11 +172,11 @@ async def trading_loop(symbols, runtime_minutes=340):
                     ex.set_leverage(LEVERAGE, sym)
                     ex.set_margin_mode('ISOLATED', sym)
                     ex.create_order(sym,'market',side,qty)
-                    sl=price*0.993 if side=='buy' else price*1.007
+                    sl=price*0.991 if side=='buy' else price*1.009
                     try:
                         ex.create_order(sym,'STOP_MARKET','sell' if side=='buy' else 'buy', qty, None, {'stopPrice':sl, 'callbackRate':TRAILING})
                     except: pass
-                    tg(f"⚡ *{side.upper()}* {sym} {tf} OB {imb:+.2f} \n💰 ${size_usdt:.2f} (Total ${total_bal:.2f} x30%) Score {score:.2f}")
+                    tg(f"⚡ *{side.upper()}* {sym} {tf} OB {imb:+.2f} \n💰 ${size_usdt:.2f} (Total ${total_bal:.2f} x30%) Score {score:.2f} Spread {brain.orderbooks[sym]['spread']:.3f}%")
                     bal=ex.fetch_balance()['USDT']['total']
                     if bal>0: 
                         new_cap=set_cap(bal)['cap']
@@ -183,8 +185,9 @@ async def trading_loop(symbols, runtime_minutes=340):
                     await asyncio.sleep(2)
                 except Exception as e: 
                     print(f"Trade error {sym}: {e}", flush=True)
+                    tg(f"⚠️ Trade fail {sym}: {str(e)[:100]}")
                     await asyncio.sleep(3)
-            await asyncio.sleep(5)
+            await asyncio.sleep(4)
         except Exception as e:
             print(f"Loop {e}"); await asyncio.sleep(5)
 
@@ -192,7 +195,7 @@ async def main():
     tickers=ex.fetch_tickers()
     syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK]
     syms=sorted(syms, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15]
-    tg(f"🚀 *HFT STARTED REST* ${START_CAP} | Compound Every Trade | {len(syms)} syms | LEV {LEVERAGE}X | Profit ∞ Loss -15%")
+    tg(f"🚀 *HFT STARTED REST AGGRO* ${START_CAP} | Threshold 0.58 | Compound Every Trade | {len(syms)} syms | LEV {LEVERAGE}X | Profit ∞ Loss -15%")
     await asyncio.gather(
         data_updater(syms, 340),
         trading_loop(syms, 340)
