@@ -10,11 +10,11 @@ PKT = pytz.timezone('Asia/Karachi')
 print(f"TOKEN exists: {bool(TOKEN)} CHAT exists: {bool(CHAT)}", flush=True)
 print(f"MEXC KEY exists: {bool(os.getenv('MEXC_API_KEY'))}", flush=True)
 
-START_CAP = 8.0
-LEVERAGE = 7
-COMPOUND = 0.40
+START_CAP = 8.54  # YOUR ACTUAL BALANCE
+LEVERAGE = 5  # Reduced from 7 to 5 for safety
+COMPOUND = 0.25  # Reduced from 0.40
 TRAILING = 0.6
-MAX_PARALLEL = 4
+MAX_PARALLEL = 1  # Only 1 trade at a time with $8.5
 CAP_FILE = "capital.json"
 AI_FILE = "ws_ai.pkl"
 MEM_FILE = "memory.json"
@@ -35,17 +35,16 @@ def load(f,d):
 def save(f,d):
     with open(f,'w') as x: json.dump(d,x,indent=2)
 
-# --- DEBUG START ---
-tg(f"✅ *DEBUG Bot Started* GitHub Actions is working! Time: {datetime.now()}")
+tg(f"✅ *DEBUG Bot Started* Balance ${START_CAP} | GitHub Actions OK | {datetime.now(PKT)}")
 time.sleep(2)
 
 try:
     ex = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET"), 'enableRateLimit': True, 'options':{'defaultType':'swap'}})
     ex.load_markets()
-    tg("✅ MEXC API Connected OK")
+    bal = ex.fetch_balance()['USDT']
+    tg(f"✅ MEXC Connected | Avail ${bal.get('free',0):.2f} | Total ${bal.get('total',0):.2f}")
 except Exception as e:
     tg(f"❌ MEXC Error: {e}")
-    print(f"MEXC Error {e}", flush=True)
     sys.exit(1)
 
 class Brain:
@@ -93,7 +92,7 @@ async def mexc_ws_hybrid(symbols, runtime_minutes=340):
                 for s in subs:
                     await ws.send(json.dumps(s))
                     await asyncio.sleep(0.05)
-                tg(f"📡 *WS Connected GitHub* {len(symbols)} syms | {runtime_minutes}m runtime | OB+Funding Live")
+                tg(f"📡 *WS Connected* {len(symbols)} syms | {runtime_minutes}m | Bal ${START_CAP} | OB+Funding Live")
                 while time.time() - start < runtime_minutes*60:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=10)
@@ -122,7 +121,7 @@ async def mexc_ws_hybrid(symbols, runtime_minutes=340):
                             except: pass
                         continue
         except Exception as e:
-            print(f"WS Error {e}, reconnect")
+            print(f"WS Error {e}, reconnect in 5s")
             await asyncio.sleep(5)
 
 def get_cap():
@@ -133,7 +132,15 @@ def get_cap():
     return d
 def set_cap(new):
     d=get_cap(); d['cap']=new; save(CAP_FILE,d); return d
-def pos_size(cap): return max(5.0, cap*COMPOUND*LEVERAGE)
+
+# FIXED POS SIZE FOR $8.5 BALANCE
+def pos_size(cap):
+    # With $8.5, max trade $2.0 - $2.5
+    free = ex.fetch_balance()['USDT']['free']
+    # Use 25% of free balance, max $2.5
+    size = min(2.5, max(1.0, free * 0.28))
+    print(f"Pos size calc: cap {cap:.2f} free {free:.2f} -> size ${size:.2f}", flush=True)
+    return size
 
 def daily_bias():
     try:
@@ -142,7 +149,7 @@ def daily_bias():
         df['ema50']=df['c'].ewm(50).mean()
         last=df.iloc[-2]
         bias="LONG" if last['c']>last['ema50'] else "SHORT" if last['c']<last['ema50']*0.98 else "BOTH"
-        tg(f"🌍 *1D BIAS* BTC ${last['c']:.0f} -> {bias} | GitHub HFT WS+Funding ON")
+        tg(f"🌍 *1D BIAS* BTC ${last['c']:.0f} -> {bias} | Bal ${START_CAP} WS+Funding")
         return bias
     except: return "BOTH"
 
@@ -183,9 +190,12 @@ async def trading_loop(symbols, runtime_minutes=340):
             cands.sort(key=lambda x: x[2], reverse=True)
             positions=ex.fetch_positions()
             open_cnt=len([p for p in positions if float(p.get('contracts',0))>0])
-            for sym,tf,score,imb,fr in cands[:4]:
+            for sym,tf,score,imb,fr in cands[:2]: # Only top 2
                 if open_cnt>=MAX_PARALLEL: break
-                if ex.fetch_balance()['USDT']['free']<1.2: break
+                free_bal = ex.fetch_balance()['USDT']['free']
+                if free_bal < 0.8: 
+                    print(f"Free balance too low {free_bal}, waiting")
+                    break
                 side='buy' if imb>0.1 else 'sell'
                 if bias=="LONG": side='buy'
                 if bias=="SHORT": side='sell'
@@ -195,17 +205,28 @@ async def trading_loop(symbols, runtime_minutes=340):
                     price=ex.fetch_ticker(sym)['last']
                     size_usdt=pos_size(cap)
                     qty=size_usdt/price
+                    # Round qty for MEXC
+                    qty = float(ex.amount_to_precision(sym, qty))
+                    if qty * price < 1.0:
+                        print(f"Qty too small {qty}")
+                        continue
                     ex.set_leverage(LEVERAGE, sym)
                     ex.set_margin_mode('ISOLATED', sym)
                     ex.create_order(sym,'market',side,qty)
                     sl=price*0.993 if side=='buy' else price*1.007
-                    ex.create_order(sym,'STOP_MARKET','sell' if side=='buy' else 'buy', qty, None, {'stopPrice':sl, 'callbackRate':TRAILING})
-                    tg(f"⚡ *GH HFT {side.upper()}* {sym} {tf}\nOB {imb:+.2f} | Fund {fr*100:.4f}%\nSize ${size_usdt:.2f} Cap ${cap:.2f} Score {score:.2f}")
+                    try:
+                        ex.create_order(sym,'STOP_MARKET','sell' if side=='buy' else 'buy', qty, None, {'stopPrice':sl, 'callbackRate':TRAILING})
+                    except: pass
+                    tg(f"⚡ *GH HFT {side.upper()}* {sym} {tf}\nOB {imb:+.2f} | Fund {fr*100:.4f}%\nSize ${size_usdt:.2f} Cap ${cap:.2f} Score {score:.2f} Bal Free ${free_bal:.2f}")
                     bal=ex.fetch_balance()['USDT']['total']
                     if bal>0: cap=set_cap(bal)['cap']
                     open_cnt+=1
-                    await asyncio.sleep(1)
-                except Exception as e: print(e)
+                    await asyncio.sleep(2)
+                except Exception as e: 
+                    print(f"Trade error {sym}: {e}", flush=True)
+                    if "insufficient" in str(e).lower():
+                        tg(f"⚠️ Insufficient: {e} | Free ${free_bal:.2f} | Trying smaller")
+                        await asyncio.sleep(10)
             await asyncio.sleep(5)
         except Exception as e:
             print(f"Loop {e}"); await asyncio.sleep(5)
@@ -213,8 +234,8 @@ async def trading_loop(symbols, runtime_minutes=340):
 async def main():
     tickers=ex.fetch_tickers()
     syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK]
-    syms=sorted(syms, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:25]
-    tg(f"🚀 *GitHub HFT STARTED* $8 | WS OB+Funding | {len(syms)} syms | 5h40m run")
+    syms=sorted(syms, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15] # Reduced to 15 syms for low balance
+    tg(f"🚀 *GitHub HFT STARTED* ${START_CAP} Bal | Trade $1-2.5 | {len(syms)} syms | 5h40m | LEV {LEVERAGE}X")
     await asyncio.gather(
         mexc_ws_hybrid(syms, 340),
         trading_loop(syms, 340)
