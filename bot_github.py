@@ -8,11 +8,10 @@ CHAT = os.getenv("CHAT_ID")
 PKT = pytz.timezone('Asia/Karachi')
 
 print(f"TOKEN exists: {bool(TOKEN)} CHAT exists: {bool(CHAT)}", flush=True)
-print(f"MEXC KEY exists: {bool(os.getenv('MEXC_API_KEY'))}", flush=True)
 
 START_CAP = 8.54
 LEVERAGE = 5
-COMPOUND_EVERY_TRADE = 0.30  # 30% of total balance every trade - compounds each trade
+COMPOUND_EVERY_TRADE = 0.30
 TRAILING = 0.6
 MAX_PARALLEL = 1
 CAP_FILE = "capital.json"
@@ -22,11 +21,8 @@ BLOCK = {'BTC','ETH','SOL','BNB','XRP','USDC','FDUSD','STOCK','ETF','GOLD'}
 
 def tg(m):
     try:
-        print(f"Sending TG: {m}", flush=True)
-        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id":CHAT,"text":m,"parse_mode":"Markdown"}, timeout=15)
-        print(f"TG Response: {r.text}", flush=True)
-    except Exception as e:
-        print(f"TG Error: {e}", flush=True)
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", json={"chat_id":CHAT,"text":m,"parse_mode":"Markdown"}, timeout=15)
+    except: pass
 
 def load(f,d):
     try:
@@ -35,14 +31,14 @@ def load(f,d):
 def save(f,d):
     with open(f,'w') as x: json.dump(d,x,indent=2)
 
-tg(f"✅ *DEBUG Bot Started* Bal ${START_CAP} | Compound Every Trade ON")
-time.sleep(2)
+tg(f"✅ *Bot Started* Bal ${START_CAP} | Compound Every Trade")
+time.sleep(1)
 
 try:
     ex = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET"), 'enableRateLimit': True, 'options':{'defaultType':'swap'}})
     ex.load_markets()
     bal = ex.fetch_balance()['USDT']
-    tg(f"✅ MEXC OK | Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f}")
+    tg(f"✅ MEXC OK Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f}")
 except Exception as e:
     tg(f"❌ MEXC Error: {e}")
     sys.exit(1)
@@ -50,7 +46,6 @@ except Exception as e:
 class Brain:
     def __init__(self):
         self.model=self._load()
-        self.mem=load(MEM_FILE, {"losses":[],"wins":[]})
         self.funding={}
         self.orderbooks={}
     def _load(self):
@@ -78,6 +73,7 @@ class Brain:
 
 brain = Brain()
 
+# FIXED WS - NO SPAM
 async def mexc_ws_hybrid(symbols, runtime_minutes=340):
     uri = "wss://contract.mexc.com/edge"
     subs=[]
@@ -86,16 +82,22 @@ async def mexc_ws_hybrid(symbols, runtime_minutes=340):
         subs.append({"method":"sub.depth", "param":{"symbol":mexc_sym}})
         subs.append({"method":"sub.fundingRate", "param":{"symbol":mexc_sym}})
     start = time.time()
+    first_connect = True
     while time.time() - start < runtime_minutes*60:
         try:
-            async with websockets.connect(uri, ping_interval=15) as ws:
+            async with websockets.connect(uri, ping_interval=20, ping_timeout=20) as ws:
                 for s in subs:
                     await ws.send(json.dumps(s))
                     await asyncio.sleep(0.05)
-                tg(f"📡 *WS Connected* {len(symbols)} syms | {runtime_minutes}m | Compound Every Trade")
+                # TG ONLY FIRST TIME - NO SPAM
+                if first_connect:
+                    tg(f"📡 *WS Connected* {len(symbols)} syms | {runtime_minutes}m | Compound Every Trade | Live")
+                    first_connect = False
+                else:
+                    print("WS Reconnected (no TG spam)", flush=True)
                 while time.time() - start < runtime_minutes*60:
                     try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=10)
+                        msg = await asyncio.wait_for(ws.recv(), timeout=15)
                         data = json.loads(msg)
                         if 'data' in data:
                             d=data['data']
@@ -111,18 +113,17 @@ async def mexc_ws_hybrid(symbols, runtime_minutes=340):
                                     if s.split('/')[0] in data.get('symbol',''):
                                         brain.funding[s]=rate
                     except asyncio.TimeoutError:
-                        for sym in symbols[:10]:
+                        # Fallback REST - no spam
+                        for sym in symbols[:8]:
                             try:
                                 ob=ex.fetch_order_book(sym, limit=20)
                                 imb, spread, bvol, avol = brain.calc_ob(ob['bids'], ob['asks'])
                                 brain.orderbooks[sym]={"imb":imb,"spread":spread,"bvol":bvol,"avol":avol}
-                                fr=ex.fetch_funding_rate(sym)
-                                brain.funding[sym]=float(fr.get('fundingRate',0))
                             except: pass
                         continue
         except Exception as e:
-            print(f"WS Error {e}")
-            await asyncio.sleep(5)
+            print(f"WS Error {e}, reconnect in 10s (no TG)", flush=True)
+            await asyncio.sleep(10)
 
 def get_cap():
     d=load(CAP_FILE, {"cap":START_CAP, "day_start":START_CAP, "date":str(datetime.now(PKT).date())})
@@ -133,17 +134,12 @@ def get_cap():
 def set_cap(new):
     d=get_cap(); d['cap']=new; save(CAP_FILE,d); return d
 
-# === COMPOUND EVERY TRADE LOGIC ===
 def pos_size():
-    # Get LIVE balance every time - compounds after each trade
     bal_data = ex.fetch_balance()['USDT']
     total = float(bal_data.get('total', START_CAP))
     free = float(bal_data.get('free', total))
-    # 30% of total, compounding
     size = total * COMPOUND_EVERY_TRADE
-    # Safety caps for $8.5 balance
-    size = max(1.0, min(free*0.90, size, 3.0))  # Never use more than 90% free, max $3
-    print(f"COMPOUND TRADE: Total ${total:.2f} Free ${free:.2f} x 30% = ${total*0.30:.2f} -> Final Size ${size:.2f}", flush=True)
+    size = max(1.0, min(free*0.90, size, 3.0))
     return size, total, free
 
 def daily_bias():
@@ -153,7 +149,7 @@ def daily_bias():
         df['ema50']=df['c'].ewm(50).mean()
         last=df.iloc[-2]
         bias="LONG" if last['c']>last['ema50'] else "SHORT" if last['c']<last['ema50']*0.98 else "BOTH"
-        tg(f"🌍 *1D BIAS* BTC ${last['c']:.0f} -> {bias}")
+        tg(f"🌍 *BIAS* BTC ${last['c']:.0f} -> {bias}")
         return bias
     except: return "BOTH"
 
@@ -165,8 +161,6 @@ async def trading_loop(symbols, runtime_minutes=340):
         try:
             cd=get_cap(); cap=cd['cap']; day_start=cd['day_start']
             dpct=(cap-day_start)/day_start*100 if day_start>0 else 0
-            
-            # LOSS FIXED -15%, PROFIT UNLIMITED
             if dpct <= -15:
                 tg(f"🛑 *DAILY -15% LOCK* ${cap:.2f} ({dpct:.1f}%) Paused till tomorrow")
                 while datetime.now(PKT).date()==last_day and time.time()-start < runtime_minutes*60:
@@ -197,12 +191,8 @@ async def trading_loop(symbols, runtime_minutes=340):
             open_cnt=len([p for p in positions if float(p.get('contracts',0))>0])
             for sym,tf,score,imb,fr in cands[:2]:
                 if open_cnt>=MAX_PARALLEL: break
-                
                 size_usdt, total_bal, free_bal = pos_size()
-                
-                if free_bal < 0.8: 
-                    print(f"Free low {free_bal}")
-                    break
+                if free_bal < 0.8: break
                 side='buy' if imb>0.1 else 'sell'
                 if bias=="LONG": side='buy'
                 if bias=="SHORT": side='sell'
@@ -220,12 +210,10 @@ async def trading_loop(symbols, runtime_minutes=340):
                     try:
                         ex.create_order(sym,'STOP_MARKET','sell' if side=='buy' else 'buy', qty, None, {'stopPrice':sl, 'callbackRate':TRAILING})
                     except: pass
-                    tg(f"⚡ *{side.upper()}* {sym} {tf} OB {imb:+.2f} Fund {fr*100:.4f}% \n💰 Size ${size_usdt:.2f} (Total ${total_bal:.2f} x30%) Cap ${cap:.2f} Score {score:.2f}")
-                    # COMPOUND UPDATE AFTER EVERY TRADE
+                    tg(f"⚡ *{side.upper()}* {sym} {tf} OB {imb:+.2f} \n💰 ${size_usdt:.2f} (Total ${total_bal:.2f} x30%) Score {score:.2f}")
                     bal=ex.fetch_balance()['USDT']['total']
                     if bal>0: 
                         new_cap=set_cap(bal)['cap']
-                        print(f"CAP COMPOUNDED: ${cap:.2f} -> ${new_cap:.2f}", flush=True)
                         cap=new_cap
                     open_cnt+=1
                     await asyncio.sleep(2)
@@ -240,7 +228,7 @@ async def main():
     tickers=ex.fetch_tickers()
     syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK]
     syms=sorted(syms, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15]
-    tg(f"🚀 *HFT STARTED* ${START_CAP} | Compound EVERY Trade 30% | {len(syms)} syms | LEV {LEVERAGE}X | Profit ∞ Loss -15%")
+    tg(f"🚀 *HFT STARTED* ${START_CAP} | Compound Every Trade | {len(syms)} syms | LEV {LEVERAGE}X | Profit ∞ Loss -15%")
     await asyncio.gather(
         mexc_ws_hybrid(syms, 340),
         trading_loop(syms, 340)
