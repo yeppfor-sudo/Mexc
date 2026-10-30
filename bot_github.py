@@ -7,13 +7,11 @@ CHAT = os.getenv("CHAT_ID")
 PKT = pytz.timezone('Asia/Karachi')
 
 START_CAP = 8.54
-LEVERAGE = 5
 COMPOUND_EVERY_TRADE = 0.30
-TRAILING = 0.6
 MAX_PARALLEL = 1
 CAP_FILE = "capital.json"
 AI_FILE = "ws_ai.pkl"
-BLOCK = {'BTC','ETH','SOL','BNB','XRP','USDC','FDUSD','STOCK','ETF','GOLD','SILVER','OIL','USOIL','UKOIL','GAS'}
+BLOCK = {'BTC','ETH','SOL','BNB','XRP','USDC','FDUSD','STOCK','ETF','GOLD','SILVER','OIL'}
 
 def tg(m):
     try:
@@ -28,14 +26,14 @@ def load(f,d):
 def save(f,d):
     with open(f,'w') as x: json.dump(d,x,indent=2)
 
-tg(f"✅ *Bot Started FINAL* Bal ${START_CAP} | 5X Manual | Threshold 0.50")
+tg(f"✅ *Bot V2 CLOSE LOGIC* Bal ${START_CAP} | TP 0.8%/1.5% SL -0.9%")
 time.sleep(1)
 
 try:
     ex = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET"), 'enableRateLimit': True, 'options':{'defaultType':'swap'}})
     ex.load_markets()
     bal = ex.fetch_balance()['USDT']
-    tg(f"✅ MEXC OK Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f} | Leverage Manual 5X")
+    tg(f"✅ MEXC OK Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f} | 5X Manual")
 except Exception as e:
     tg(f"❌ MEXC Error: {e}"); sys.exit(1)
 
@@ -69,7 +67,6 @@ brain = Brain()
 
 async def data_updater(symbols, runtime_minutes=340):
     start = time.time()
-    tg(f"📡 *REST Live* {len(symbols)} syms | Manual 5X")
     while time.time() - start < runtime_minutes*60:
         for sym in symbols:
             try:
@@ -99,96 +96,112 @@ def pos_size():
     size = max(1.0, min(free*0.90, size, 3.0))
     return size, total, free
 
-def daily_bias():
-    try:
-        btc=ex.fetch_ohlcv('BTC/USDT:USDT','1d',limit=100)
-        df=pd.DataFrame(btc, columns=['t','o','h','l','c','v'])
-        df['ema50']=df['c'].ewm(50).mean()
-        last=df.iloc[-2]
-        bias="LONG" if last['c']>last['ema50'] else "SHORT" if last['c']<last['ema50']*0.98 else "BOTH"
-        tg(f"🌍 *BIAS* BTC ${last['c']:.0f} -> {bias}")
-        return bias
-    except: return "BOTH"
-
 async def trading_loop(symbols, runtime_minutes=340):
-    bias=daily_bias()
-    last_day=datetime.now(PKT).date()
     start=time.time()
     no_trade_count=0
     while time.time() - start < runtime_minutes*60:
         try:
-            cd=get_cap(); cap=cd['cap']; day_start=cd['day_start']
-            dpct=(cap-day_start)/day_start*100 if day_start>0 else 0
-            if dpct <= -15:
-                tg(f"🛑 *DAILY -15% LOCK* ${cap:.2f} ({dpct:.1f}%)")
-                while datetime.now(PKT).date()==last_day and time.time()-start < runtime_minutes*60:
-                    await asyncio.sleep(60)
-                bias=daily_bias(); last_day=datetime.now(PKT).date(); continue
+            # ========== CLOSE MANAGER (THIS WAS MISSING!) ==========
+            try:
+                positions=ex.fetch_positions()
+                for p in positions:
+                    contracts=float(p.get('contracts',0) or 0)
+                    if contracts==0: continue
+                    sym=p['symbol']
+                    entry=float(p.get('entryPrice',0) or 0)
+                    mark=float(p.get('markPrice',0) or entry)
+                    side_p=p.get('side','long')
+                    if entry==0: continue
+                    pnl_pct=(mark-entry)/entry*100 if side_p=='long' else (entry-mark)/entry*100
+                    pnl_pct*=5  # 5X leverage
+                    # Get live AI score for this coin
+                    try:
+                        ohlcv=ex.fetch_ohlcv(sym,'1m',limit=70)
+                        df=pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+                        score=brain.score(df,sym) if len(df)>=60 else 0.5
+                    except:
+                        score=0.5
+                    ob=brain.orderbooks.get(sym, {"imb":0})
+                    imb=ob.get('imb',0)
+                    should_close=False; reason=""
+                    if pnl_pct >= 1.5:
+                        should_close=True; reason=f"TP HARD +{pnl_pct:.2f}%"
+                    elif pnl_pct >= 0.8 and imb < -0.15:
+                        should_close=True; reason=f"TP OB Bear {pnl_pct:.2f}% imb {imb:.2f}"
+                    elif pnl_pct >= 2.5:
+                        should_close=True; reason=f"TP MOON +{pnl_pct:.2f}%"
+                    elif pnl_pct <= -0.9:
+                        should_close=True; reason=f"SL {pnl_pct:.2f}%"
+                    elif score < 0.32:
+                        should_close=True; reason=f"AI Reversal {score:.2f} PNL {pnl_pct:.2f}%"
+                    if should_close:
+                        close_side='sell' if side_p=='long' else 'buy'
+                        ex.create_order(sym,'market',close_side,contracts)
+                        tg(f"🔒 *CLOSE* {sym} | {reason} | Score {score:.2f}")
+                        bal=ex.fetch_balance()['USDT']['total']
+                        if bal>0: set_cap(bal)
+                        print(f"CLOSED {sym} {reason}", flush=True)
+                        await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Close mgr error {e}", flush=True)
 
+            # ========== OPEN MANAGER ==========
             cands=[]; all_scores=[]
             for sym in symbols:
                 try:
-                    fr=brain.funding.get(sym,0)
                     ob=brain.orderbooks.get(sym)
                     if not ob: continue
                     if ob['spread']>0.40: continue
-                    for tf in ['1m','5m']:
-                        ohlcv=ex.fetch_ohlcv(sym,tf,limit=100)
-                        df=pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
-                        if len(df)<60: continue
-                        score=brain.score(df,sym)
-                        all_scores.append((sym,score,ob['imb']))
-                        if score>0.50:
-                            cands.append((sym,tf,score,ob['imb'],fr))
-                            break
+                    ohlcv=ex.fetch_ohlcv(sym,'1m',limit=80)
+                    df=pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
+                    if len(df)<60: continue
+                    score=brain.score(df,sym)
+                    all_scores.append((sym,score,ob['imb']))
+                    if score>0.50:
+                        cands.append((sym,score,ob['imb']))
                 except: continue
             all_scores.sort(key=lambda x: x[1], reverse=True)
-            cands.sort(key=lambda x: x[2], reverse=True)
-            print(f"Scan: {len(cands)} candidates | Top: {all_scores[:2] if all_scores else 'none'}", flush=True)
+            cands.sort(key=lambda x: x[1], reverse=True)
+            print(f"Scan: {len(cands)} cands | Top {all_scores[:3]}", flush=True)
+
             if len(cands)==0:
                 no_trade_count+=1
             else:
                 no_trade_count=0
             if len(cands)==0 and no_trade_count>=4 and all_scores:
-                best_sym, best_score, best_imb = all_scores[0]
-                if best_score>0.42:
-                    print(f"FORCE TRADE {best_sym} {best_score:.3f}", flush=True)
-                    cands=[(best_sym,'1m',best_score,best_imb,0)]
-                    no_trade_count=0
+                if all_scores[0][1]>0.42:
+                    cands=[all_scores[0]]
 
             positions=ex.fetch_positions()
-            open_cnt=len([p for p in positions if float(p.get('contracts',0))>0])
-            for sym,tf,score,imb,fr in cands[:1]:
-                if open_cnt>=MAX_PARALLEL: break
-                if 'SILVER' in sym or 'GOLD' in sym: continue
-                size_usdt, total_bal, free_bal = pos_size()
-                if free_bal < 0.8: break
-                side='buy' if imb>-0.1 else 'sell'
-                try:
-                    price=ex.fetch_ticker(sym)['last']
-                    market = ex.market(sym)
-                    min_amt = market.get('limits',{}).get('amount',{}).get('min',0)
-                    qty=size_usdt/price
-                    qty = float(ex.amount_to_precision(sym, qty))
-                    if min_amt and qty < min_amt: 
-                        print(f"Skip {sym} qty {qty} < min {min_amt}", flush=True)
-                        continue
-                    if qty * price < 1.0: continue
-                    # NO LEVERAGE CALL - Using manual 5X from app
-                    ex.create_order(sym,'market',side,qty)
-                    tg(f"⚡ *{side.upper()}* {sym} {tf} Score {score:.2f} OB {imb:+.2f} \n💰 ${size_usdt:.2f} (Total ${total_bal:.2f} x30%) 5X Manual")
-                    bal=ex.fetch_balance()['USDT']['total']
-                    if bal>0: set_cap(bal)
-                    open_cnt+=1
-                    no_trade_count=0
-                    await asyncio.sleep(2)
-                except Exception as e: 
-                    print(f"Trade error {sym}: {e}", flush=True)
-                    tg(f"⚠️ Fail {sym}: {str(e)[:100]}")
-                    await asyncio.sleep(2)
+            open_cnt=len([p for p in positions if float(p.get('contracts',0) or 0)>0])
+            if open_cnt < MAX_PARALLEL:
+                for sym,score,imb in cands[:1]:
+                    if 'SILVER' in sym or 'GOLD' in sym: continue
+                    size_usdt, total_bal, free_bal = pos_size()
+                    if free_bal < 0.8: break
+                    side='buy' if imb>-0.1 else 'sell'
+                    try:
+                        price=ex.fetch_ticker(sym)['last']
+                        qty=size_usdt/price
+                        qty=float(ex.amount_to_precision(sym, qty))
+                        market=ex.market(sym)
+                        min_amt=market.get('limits',{}).get('amount',{}).get('min',0)
+                        if min_amt and qty < min_amt: continue
+                        if qty*price < 1.0: continue
+                        # NO LEVERAGE CALL - MANUAL 5X
+                        ex.create_order(sym,'market',side,qty)
+                        tg(f"⚡ *{side.upper()}* {sym} Score {score:.2f} OB {imb:+.2f} 💰 ${size_usdt:.2f} / ${total_bal:.2f}")
+                        bal=ex.fetch_balance()['USDT']['total']
+                        if bal>0: set_cap(bal)
+                        no_trade_count=0
+                        await asyncio.sleep(2)
+                        break
+                    except Exception as e:
+                        print(f"Open err {sym} {e}", flush=True)
+                        await asyncio.sleep(1)
             await asyncio.sleep(3)
         except Exception as e:
-            print(f"Loop {e}"); await asyncio.sleep(5)
+            print(f"Loop err {e}"); await asyncio.sleep(5)
 
 async def main():
     tickers=ex.fetch_tickers()
@@ -201,14 +214,8 @@ async def main():
                 filtered.append(s)
         except: pass
     syms=sorted(filtered, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15]
-    if len(syms)<5:
-        syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK and 'SILVER' not in s and 'GOLD' not in s]
-        syms=sorted(syms, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15]
-    tg(f"🚀 *HFT FINAL FIXED* ${START_CAP} | 0.50 Force | {len(syms)} syms | {', '.join([x.split('/')[0] for x in syms[:5]])} | 5X Manual | Profit ∞ Loss -15%")
-    await asyncio.gather(
-        data_updater(syms, 340),
-        trading_loop(syms, 340)
-    )
+    tg(f"🚀 *V2 OPEN+CLOSE* {len(syms)} syms | 5X Isolated Manual | TP 0.8%/1.5% SL -0.9% AI<0.32")
+    await asyncio.gather(data_updater(syms, 340), trading_loop(syms, 340))
 
 if __name__=="__main__":
     asyncio.run(main())
