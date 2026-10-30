@@ -28,14 +28,14 @@ def load(f,d):
 def save(f,d):
     with open(f,'w') as x: json.dump(d,x,indent=2)
 
-tg(f"✅ *Bot Started ULTRA* Bal ${START_CAP} | Threshold 0.50 | Force Trade ON")
+tg(f"✅ *Bot Started FINAL* Bal ${START_CAP} | 5X Manual | Threshold 0.50")
 time.sleep(1)
 
 try:
     ex = ccxt.mexc({'apiKey': os.getenv("MEXC_API_KEY"), 'secret': os.getenv("MEXC_SECRET"), 'enableRateLimit': True, 'options':{'defaultType':'swap'}})
     ex.load_markets()
     bal = ex.fetch_balance()['USDT']
-    tg(f"✅ MEXC OK Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f}")
+    tg(f"✅ MEXC OK Avail ${bal.get('free',0):.2f} Total ${bal.get('total',0):.2f} | Leverage Manual 5X")
 except Exception as e:
     tg(f"❌ MEXC Error: {e}"); sys.exit(1)
 
@@ -69,7 +69,7 @@ brain = Brain()
 
 async def data_updater(symbols, runtime_minutes=340):
     start = time.time()
-    tg(f"📡 *REST Live* {len(symbols)} syms | Ultra Aggro")
+    tg(f"📡 *REST Live* {len(symbols)} syms | Manual 5X")
     while time.time() - start < runtime_minutes*60:
         for sym in symbols:
             try:
@@ -106,7 +106,7 @@ def daily_bias():
         df['ema50']=df['c'].ewm(50).mean()
         last=df.iloc[-2]
         bias="LONG" if last['c']>last['ema50'] else "SHORT" if last['c']<last['ema50']*0.98 else "BOTH"
-        tg(f"🌍 *BIAS* BTC ${last['c']:.0f} -> {bias} | Ultra ON")
+        tg(f"🌍 *BIAS* BTC ${last['c']:.0f} -> {bias}")
         return bias
     except: return "BOTH"
 
@@ -125,76 +125,58 @@ async def trading_loop(symbols, runtime_minutes=340):
                     await asyncio.sleep(60)
                 bias=daily_bias(); last_day=datetime.now(PKT).date(); continue
 
-            cands=[]
-            all_scores=[]
+            cands=[]; all_scores=[]
             for sym in symbols:
                 try:
                     fr=brain.funding.get(sym,0)
                     ob=brain.orderbooks.get(sym)
                     if not ob: continue
-                    if ob['spread']>0.40: continue  # Very loose
+                    if ob['spread']>0.40: continue
                     for tf in ['1m','5m']:
                         ohlcv=ex.fetch_ohlcv(sym,tf,limit=100)
                         df=pd.DataFrame(ohlcv, columns=['t','o','h','l','c','v'])
                         if len(df)<60: continue
                         score=brain.score(df,sym)
                         all_scores.append((sym,score,ob['imb']))
-                        if score>0.50:  # ULTRA LOW 0.50
+                        if score>0.50:
                             cands.append((sym,tf,score,ob['imb'],fr))
                             break
                 except: continue
-            
-            # DEBUG: Show top 3 scores even if below 0.50
             all_scores.sort(key=lambda x: x[1], reverse=True)
-            if all_scores:
-                print(f"Top scores: {all_scores[:3]}", flush=True)
-            
             cands.sort(key=lambda x: x[2], reverse=True)
-            print(f"Scan: {len(cands)} candidates | Top scores: {all_scores[:2] if all_scores else 'none'}", flush=True)
-
-            # FORCE TRADE LOGIC: If 0 candidates for 8 scans (~1 min), trade best score anyway
+            print(f"Scan: {len(cands)} candidates | Top: {all_scores[:2] if all_scores else 'none'}", flush=True)
             if len(cands)==0:
                 no_trade_count+=1
             else:
                 no_trade_count=0
-
-            if len(cands)==0 and no_trade_count>=6 and all_scores:
-                # Force trade best available even if 0.45
+            if len(cands)==0 and no_trade_count>=4 and all_scores:
                 best_sym, best_score, best_imb = all_scores[0]
-                if best_score>0.42:  # Absolute minimum
-                    print(f"FORCE TRADE {best_sym} score {best_score:.3f} after {no_trade_count} empty scans", flush=True)
-                    tg(f"⚠️ *FORCE* {best_sym} Score {best_score:.2f} after {no_trade_count} scans - low vol market")
+                if best_score>0.42:
+                    print(f"FORCE TRADE {best_sym} {best_score:.3f}", flush=True)
                     cands=[(best_sym,'1m',best_score,best_imb,0)]
                     no_trade_count=0
 
             positions=ex.fetch_positions()
             open_cnt=len([p for p in positions if float(p.get('contracts',0))>0])
-            for sym,tf,score,imb,fr in cands[:1]:  # Only 1 at a time
+            for sym,tf,score,imb,fr in cands[:1]:
                 if open_cnt>=MAX_PARALLEL: break
                 if 'SILVER' in sym or 'GOLD' in sym: continue
                 size_usdt, total_bal, free_bal = pos_size()
                 if free_bal < 0.8: break
                 side='buy' if imb>-0.1 else 'sell'
-                if bias=="LONG" and imb>-0.3: side='buy'
-                if bias=="SHORT" and imb<0.3: side='sell'
                 try:
                     price=ex.fetch_ticker(sym)['last']
                     market = ex.market(sym)
                     min_amt = market.get('limits',{}).get('amount',{}).get('min',0)
                     qty=size_usdt/price
                     qty = float(ex.amount_to_precision(sym, qty))
-                    if min_amt and qty < min_amt:
+                    if min_amt and qty < min_amt: 
                         print(f"Skip {sym} qty {qty} < min {min_amt}", flush=True)
                         continue
                     if qty * price < 1.0: continue
-                    ex.set_leverage(LEVERAGE, sym)
-                    ex.set_margin_mode('ISOLATED', sym)
+                    # NO LEVERAGE CALL - Using manual 5X from app
                     ex.create_order(sym,'market',side,qty)
-                    sl=price*0.991 if side=='buy' else price*1.009
-                    try:
-                        ex.create_order(sym,'STOP_MARKET','sell' if side=='buy' else 'buy', qty, None, {'stopPrice':sl, 'callbackRate':TRAILING})
-                    except: pass
-                    tg(f"⚡ *{side.upper()}* {sym} {tf} Score {score:.2f} OB {imb:+.2f} \n💰 ${size_usdt:.2f} (Total ${total_bal:.2f} x30%)")
+                    tg(f"⚡ *{side.upper()}* {sym} {tf} Score {score:.2f} OB {imb:+.2f} \n💰 ${size_usdt:.2f} (Total ${total_bal:.2f} x30%) 5X Manual")
                     bal=ex.fetch_balance()['USDT']['total']
                     if bal>0: set_cap(bal)
                     open_cnt+=1
@@ -202,6 +184,7 @@ async def trading_loop(symbols, runtime_minutes=340):
                     await asyncio.sleep(2)
                 except Exception as e: 
                     print(f"Trade error {sym}: {e}", flush=True)
+                    tg(f"⚠️ Fail {sym}: {str(e)[:100]}")
                     await asyncio.sleep(2)
             await asyncio.sleep(3)
         except Exception as e:
@@ -210,19 +193,18 @@ async def trading_loop(symbols, runtime_minutes=340):
 async def main():
     tickers=ex.fetch_tickers()
     syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK and 'SILVER' not in s and 'GOLD' not in s]
-    # Filter low price coins good for $2.5 size
     filtered=[]
     for s in syms:
         try:
             price=tickers.get(s,{}).get('last',0)
-            if price and 0.000001 < price < 5:  # Only cheap coins for small balance
+            if price and 0.000001 < price < 5:
                 filtered.append(s)
         except: pass
     syms=sorted(filtered, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15]
     if len(syms)<5:
-        syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK and 'SILVER' not in s and 'GOLD' not in s][:15]
+        syms=[s for s in ex.markets if s.endswith('USDT:USDT') and s.split('/')[0] not in BLOCK and 'SILVER' not in s and 'GOLD' not in s]
         syms=sorted(syms, key=lambda s: tickers.get(s,{}).get('quoteVolume',0), reverse=True)[:15]
-    tg(f"🚀 *HFT ULTRA* ${START_CAP} | Threshold 0.50 + Force | {len(syms)} syms | {', '.join([x.split('/')[0] for x in syms[:5]])} | LEV {LEVERAGE}X | Profit ∞ Loss -15%")
+    tg(f"🚀 *HFT FINAL FIXED* ${START_CAP} | 0.50 Force | {len(syms)} syms | {', '.join([x.split('/')[0] for x in syms[:5]])} | 5X Manual | Profit ∞ Loss -15%")
     await asyncio.gather(
         data_updater(syms, 340),
         trading_loop(syms, 340)
