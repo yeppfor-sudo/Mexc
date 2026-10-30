@@ -1,0 +1,17 @@
+name: Keeper 24/7
+on:
+  schedule:
+    - cron: '5 */6 * * *'  # 5 min after main, ensures restart
+  workflow_dispatch:
+
+jobs:
+  keep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trigger Bot
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          curl -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot.yml/dispatches -d '{"ref":"main"}'
+          echo "Keeper triggered bot restart for 24/7"
